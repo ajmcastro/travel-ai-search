@@ -23,9 +23,13 @@ build/
 # macOS
 .DS_Store
 
-# Generated data (added in later milestones)
-data/raw/
-data/processed/
+# Generated data — ignore file contents but commit the directory markers (.gitkeep)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/evaluation/results/*
+!data/evaluation/results/.gitkeep
 
 # Notebooks
 notebooks/.ipynb_checkpoints/
@@ -40,6 +44,3 @@ htmlcov/
 
 # ruff
 .ruff_cache/
-
-# Experiment results
-data/evaluation/results/

@@ -36,6 +36,10 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 
+[tool.ruff.lint.per-file-ignores]
+# Destination data rows are intentionally kept one-per-line for readability.
+"scripts/generate_dataset.py" = ["E501"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
