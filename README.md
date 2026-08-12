@@ -25,16 +25,16 @@ Completed milestones: **0**
 
 ```bash
 # 1. Clone and enter the repo
-git clone <repo-url> travel-ai-search && cd travel-ai-search
+git clone https://github.com/ajmcastro/travel-ai-search.git && cd travel-ai-search
 
 # 2. Install Python dependencies
-uv sync
+make install
 
 # 3. Start OpenSearch
-docker compose up -d
+make up
 
 # 4. Wait ~30 s for OpenSearch to initialise, then verify connectivity
-uv run python scripts/healthcheck.py
+make health
 ```
 
 Expected output:
@@ -53,22 +53,22 @@ Health check passed.
 
 ```bash
 # Install / sync dependencies
-uv sync
+make install
 
 # Unit tests (no infrastructure required)
-uv run pytest
+make test
 
 # Integration tests (requires OpenSearch running)
-uv run pytest tests/integration
+make test-integration
 
 # Linting
-uv run ruff check .
+make lint
 
 # Auto-fix lint issues
-uv run ruff check --fix .
+make lint-fix
 
 # Type checking
-uv run mypy src
+make typecheck
 ```
 
 ---
@@ -78,7 +78,7 @@ uv run mypy src
 Copy `.env.example` to `.env` and adjust if needed. All settings have sensible defaults for local development:
 
 ```bash
-cp .env.example .env
+make env
 ```
 
 The most common override — if OpenSearch runs on a different host or port:
@@ -113,8 +113,8 @@ Modules for retrieval, embeddings, reranking etc. are introduced in later milest
 ## Stopping OpenSearch
 
 ```bash
-docker compose down          # stop containers, keep data volume
-docker compose down -v       # stop containers and delete data volume
+make down         # stop containers, keep data volume
+make down-v       # stop containers and delete data volume
 ```
 
 ---
