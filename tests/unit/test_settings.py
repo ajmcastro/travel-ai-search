@@ -41,6 +41,16 @@ def test_env_var_enables_ssl(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.opensearch_use_ssl is True
 
 
+def test_default_index_name() -> None:
+    assert Settings().opensearch_index_name == "travel_hotels"
+
+
+def test_env_var_overrides_index_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENSEARCH_INDEX_NAME", "travel_hotels_staging")
+    s = Settings()
+    assert s.opensearch_index_name == "travel_hotels_staging"
+
+
 def test_get_settings_returns_same_instance() -> None:
     get_settings.cache_clear()
     a = get_settings()

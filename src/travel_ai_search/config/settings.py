@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     opensearch_port: int = 9200
     opensearch_use_ssl: bool = False
     opensearch_verify_certs: bool = False
+    opensearch_index_name: str = "travel_hotels"
 
     # Application
     log_level: str = "INFO"
