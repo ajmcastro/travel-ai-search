@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     environment: str = "development"
 
+    # Search
+    top_k: int = 10
+
 
 @lru_cache
 def get_settings() -> Settings:

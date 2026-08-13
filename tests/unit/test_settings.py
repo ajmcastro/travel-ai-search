@@ -51,6 +51,16 @@ def test_env_var_overrides_index_name(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.opensearch_index_name == "travel_hotels_staging"
 
 
+def test_default_top_k() -> None:
+    assert Settings().top_k == 10
+
+
+def test_env_var_overrides_top_k(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TOP_K", "25")
+    s = Settings()
+    assert s.top_k == 25
+
+
 def test_get_settings_returns_same_instance() -> None:
     get_settings.cache_clear()
     a = get_settings()

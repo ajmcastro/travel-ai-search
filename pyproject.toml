@@ -5,12 +5,15 @@ description = "Educational project demonstrating modern AI search architectures 
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.141.1",
     "opensearch-py>=2.7.0",
     "pydantic-settings>=2.6.0",
+    "uvicorn>=0.52.2",
 ]
 
 [dependency-groups]
 dev = [
+    "httpx2>=2.10.0",
     "mypy>=1.13.0",
     "pytest>=8.3.0",
     "ruff>=0.8.0",
@@ -39,6 +42,8 @@ select = ["E", "F", "I", "UP"]
 [tool.ruff.lint.per-file-ignores]
 # Destination data rows are intentionally kept one-per-line for readability.
 "scripts/generate_dataset.py" = ["E501"]
+# Lambda criteria in the golden dataset builder are kept one-per-line for readability.
+"scripts/build_golden_dataset.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"

@@ -1,0 +1,196 @@
+"""Evaluation CLI — runs retrieval strategies against the golden dataset.
+
+Usage:
+    uv run python scripts/evaluate.py                   # BM25 only (default)
+    uv run python scripts/evaluate.py --strategy bm25
+    uv run python scripts/evaluate.py --k 10 --no-save  # skip JSON output
+    uv run python scripts/evaluate.py --golden data/evaluation/golden_queries.jsonl
+
+Output:
+    Console table broken down by query class.
+    JSON results saved to data/evaluation/results/<strategy>_<date>.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+# Ensure src is importable when run as a script
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from travel_ai_search.config.settings import get_settings
+from travel_ai_search.evaluation.dataset import load_dataset
+from travel_ai_search.evaluation.evaluator import EvaluationReport, evaluate
+from travel_ai_search.infrastructure.opensearch import create_client
+from travel_ai_search.retrieval.lexical import LexicalSearchParams, lexical_search
+
+GOLDEN_DEFAULT = Path("data/evaluation/golden_queries.jsonl")
+RESULTS_DIR = Path("data/evaluation/results")
+
+
+# ── Strategy factories ────────────────────────────────────────────────────────
+
+
+def make_bm25_fn(client: Any, index: str) -> Any:
+    """Return a SearchFn that calls BM25 lexical search."""
+
+    def search(query_text: str, top_k: int, filters: dict[str, Any]) -> list[str]:
+        params = LexicalSearchParams(query=query_text, top_k=top_k, **filters)
+        result = lexical_search(client, params, index=index)
+        return [hit.id for hit in result.hits]
+
+    return search
+
+
+STRATEGIES: dict[str, Any] = {
+    "bm25": make_bm25_fn,
+}
+
+
+# ── Formatting ────────────────────────────────────────────────────────────────
+
+
+def _fmt(value: float) -> str:
+    return f"{value:.4f}"
+
+
+def _bar(value: float, width: int = 20) -> str:
+    filled = int(round(value * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def print_report(report: EvaluationReport) -> None:
+    k = report.k
+    width = 80
+
+    print()
+    print("=" * width)
+    print(f"  Strategy: {report.strategy.upper()}   |   @K={k}   |   {report.n_queries} queries")
+    print("=" * width)
+
+    # Overall metrics
+    print()
+    print("  OVERALL")
+    print(f"  {'NDCG@K':<18} {_fmt(report.overall_ndcg)}  {_bar(report.overall_ndcg)}")
+    print(f"  {'MRR':<18} {_fmt(report.mrr)}  {_bar(report.mrr)}")
+    print(f"  {'HitRate@K':<18} {_fmt(report.overall_hit_rate)}  {_bar(report.overall_hit_rate)}")
+    print(
+        f"  {'Precision@K':<18} {_fmt(report.overall_precision)}  {_bar(report.overall_precision)}"
+    )
+    print(
+        f"  {'Recall@K':<18} {_fmt(report.overall_recall)}  (note: low; many judged docs per query)"
+    )
+    print(f"  {'MAP':<18} {_fmt(report.map_score)}")
+    print(f"  {'Latency p50':<18} {report.latency_p50_ms} ms")
+    print(f"  {'Latency p95':<18} {report.latency_p95_ms} ms")
+
+    # Per-class breakdown
+    print()
+    print("  BY QUERY CLASS")
+    header = f"  {'Class':<22} {'n':>3}  {'NDCG':>6}  {'MRR':>6}  {'HR':>6}  {'P':>6}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for cls in report.by_class():
+        print(
+            f"  {cls.query_class:<22} {cls.n_queries:>3}  "
+            f"{_fmt(cls.ndcg):>6}  {_fmt(cls.mrr):>6}  "
+            f"{_fmt(cls.hit_rate):>6}  {_fmt(cls.precision):>6}"
+        )
+
+    # Bottom-5 queries by NDCG
+    sorted_queries = sorted(report.per_query, key=lambda q: q.ndcg)
+    print()
+    print("  LOWEST NDCG@K QUERIES")
+    for q in sorted_queries[:5]:
+        print(f"  [{q.query_id}] {_fmt(q.ndcg)}  {q.query_text[:60]}")
+
+    print()
+    print("=" * width)
+    print()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Evaluate a retrieval strategy against the golden relevance dataset."
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=list(STRATEGIES),
+        default="bm25",
+        help="Retrieval strategy to evaluate (default: bm25)",
+    )
+    parser.add_argument(
+        "--golden",
+        type=Path,
+        default=GOLDEN_DEFAULT,
+        help=f"Path to the golden queries JSONL file (default: {GOLDEN_DEFAULT})",
+    )
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=10,
+        help="Rank cutoff for metrics (default: 10)",
+    )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Do not save JSON results to disk",
+    )
+    args = parser.parse_args(argv)
+
+    # Infrastructure
+    settings = get_settings()
+    try:
+        client = create_client(settings)
+        client.info()
+    except Exception as exc:
+        host = f"{settings.opensearch_host}:{settings.opensearch_port}"
+        print(f"\nERROR: Cannot connect to OpenSearch at {host}")
+        print(f"  {exc}")
+        print("  Start OpenSearch with:  make up")
+        sys.exit(1)
+
+    # Load dataset
+    if not args.golden.exists():
+        print(f"\nERROR: Golden dataset not found: {args.golden}")
+        print("  Build it with:  uv run python scripts/build_golden_dataset.py")
+        sys.exit(1)
+
+    print(f"\nLoading golden dataset from {args.golden} …")
+    dataset = load_dataset(args.golden)
+    print(f"  {len(dataset)} queries across {len(dataset.by_class())} classes")
+
+    # Build search function
+    factory = STRATEGIES[args.strategy]
+    search_fn = factory(client, settings.opensearch_index_name)
+
+    # Evaluate
+    print(f"\nRunning evaluation: strategy={args.strategy}, k={args.k} …")
+    report = evaluate(search_fn, dataset, strategy=args.strategy, k=args.k)
+
+    # Print
+    print_report(report)
+
+    # Save
+    if not args.no_save:
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        filename = f"{args.strategy}_{date.today().isoformat()}.json"
+        output_path = RESULTS_DIR / filename
+        output_path.write_text(
+            json.dumps(report.to_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"  Results saved to: {output_path}")
+        print()
+
+
+if __name__ == "__main__":
+    main()
