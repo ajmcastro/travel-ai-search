@@ -31,6 +31,8 @@ from typing import Any
 from opensearchpy import OpenSearch
 
 from travel_ai_search.ingestion.index import INDEX_NAME
+from travel_ai_search.retrieval.fusion import build_filter_clauses
+from travel_ai_search.retrieval.types import Hit
 
 # Fields included in the BM25 multi-match query, with boost factors.
 _SEARCH_FIELDS: list[str] = [
@@ -74,15 +76,6 @@ class LexicalSearchParams:
 
 
 @dataclass
-class Hit:
-    """A single document returned from OpenSearch."""
-
-    id: str
-    score: float
-    source: dict[str, Any]
-
-
-@dataclass
 class LexicalSearchResult:
     hits: list[Hit]
     total: int
@@ -114,23 +107,16 @@ def _build_query(params: LexicalSearchParams) -> dict[str, Any]:
         query_clause = {"match_all": {}}
 
     # ── Hard-constraint filters ──────────────────────────────────────────────
-    filters: list[dict[str, Any]] = []
-    if params.country is not None:
-        filters.append({"term": {"country": params.country}})
-    if params.destination is not None:
-        filters.append({"term": {"destination": params.destination}})
-    if params.family_friendly is not None:
-        filters.append({"term": {"family_friendly": params.family_friendly}})
-    if params.adults_only is not None:
-        filters.append({"term": {"adults_only": params.adults_only}})
-    if params.min_star_rating is not None:
-        filters.append({"range": {"star_rating": {"gte": params.min_star_rating}}})
-    if params.max_price is not None:
-        filters.append({"range": {"price_per_person_gbp": {"lte": params.max_price}}})
-    if params.month is not None:
-        filters.append({"term": {"available_months": params.month}})
-    if params.airport is not None:
-        filters.append({"term": {"available_departure_airports": params.airport}})
+    filters = build_filter_clauses(
+        country=params.country,
+        destination=params.destination,
+        family_friendly=params.family_friendly,
+        adults_only=params.adults_only,
+        min_star_rating=params.min_star_rating,
+        max_price=params.max_price,
+        month=params.month,
+        airport=params.airport,
+    )
 
     bool_clause: dict[str, Any] = {"must": [query_clause]}
     if filters:

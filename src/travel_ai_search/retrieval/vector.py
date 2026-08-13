@@ -26,7 +26,8 @@ from opensearchpy import OpenSearch
 
 from travel_ai_search.embeddings.base import EmbeddingProvider
 from travel_ai_search.ingestion.index import INDEX_NAME
-from travel_ai_search.retrieval.lexical import Hit
+from travel_ai_search.retrieval.fusion import build_filter_clauses
+from travel_ai_search.retrieval.types import Hit
 
 # The vector field name must match the knn_vector mapping in index.py.
 _VECTOR_FIELD = "embedding_vector"
@@ -60,33 +61,6 @@ class VectorSearchResult:
     took_ms: int
 
 
-def _build_filter_clauses(params: VectorSearchParams) -> list[dict[str, Any]]:
-    """Return OpenSearch filter clauses for the active filter parameters.
-
-    Shared logic between _build_vector_query and the lexical module.
-    Kept here rather than extracted to a shared utility to keep each module
-    self-contained — the hybrid module (Milestone 6) will consolidate.
-    """
-    clauses: list[dict[str, Any]] = []
-    if params.country is not None:
-        clauses.append({"term": {"country": params.country}})
-    if params.destination is not None:
-        clauses.append({"term": {"destination": params.destination}})
-    if params.family_friendly is not None:
-        clauses.append({"term": {"family_friendly": params.family_friendly}})
-    if params.adults_only is not None:
-        clauses.append({"term": {"adults_only": params.adults_only}})
-    if params.min_star_rating is not None:
-        clauses.append({"range": {"star_rating": {"gte": params.min_star_rating}}})
-    if params.max_price is not None:
-        clauses.append({"range": {"price_per_person_gbp": {"lte": params.max_price}}})
-    if params.month is not None:
-        clauses.append({"term": {"available_months": params.month}})
-    if params.airport is not None:
-        clauses.append({"term": {"available_departure_airports": params.airport}})
-    return clauses
-
-
 def _build_vector_query(
     vector: list[float],
     params: VectorSearchParams,
@@ -98,7 +72,16 @@ def _build_vector_query(
     The knn clause uses efficient filter mode when filters are present.
     With no filters, it performs a plain ANN search across all documents.
     """
-    filter_clauses = _build_filter_clauses(params)
+    filter_clauses = build_filter_clauses(
+        country=params.country,
+        destination=params.destination,
+        family_friendly=params.family_friendly,
+        adults_only=params.adults_only,
+        min_star_rating=params.min_star_rating,
+        max_price=params.max_price,
+        month=params.month,
+        airport=params.airport,
+    )
 
     knn_clause: dict[str, Any] = {
         "vector": vector,

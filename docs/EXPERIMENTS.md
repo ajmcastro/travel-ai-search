@@ -197,3 +197,66 @@ Results are also saved as machine-readable JSON under `data/evaluation/results/`
 **Next question this raises:**
 - Can hybrid retrieval (BM25 + vector fusion) combine the precision of BM25 for exact-term queries with the recall of vector search for semantic queries? Hypothesis: yes — RRF fusion should produce NDCG ≥ 0.70. (Milestone 6–7)
 - Does the activities/budget gap reveal a fundamental limit of dense retrieval, or can a better embedding text (including more structured fields) close it? Worth investigating by adding activity list and price tier to the embedding text.
+
+---
+
+### [Milestone 6] Hybrid retrieval vs BM25 and Vector
+
+**Date:** 2026-08-13
+**Hypothesis:** Combining BM25 and vector retrieval via min-max normalised weighted-sum fusion (50/50 default) will improve on BM25 (NDCG 0.50) and approach or match vector (NDCG 0.69) — getting the best of both: vector's semantic recall and BM25's precision for exact-term queries.
+
+**Configuration:**
+- index: `travel_hotels` (5,470 hotels, lucene/HNSW, cosinesimil)
+- embedding model: `all-MiniLM-L6-v2` (384d, L2-normalised)
+- fusion: client-side min-max normalised weighted sum
+- `candidate_k=50` (each retriever fetches 50 candidates; fusion selects top 10 from ≤ 100 unique)
+- `lexical_weight=0.5`, `vector_weight=0.5`
+- strategy: `hybrid` — lexical → vector → `fuse_results()` → top 10
+- golden dataset: 62 queries, 10 classes, 48,675 judgments
+- results file: `data/evaluation/results/hybrid_2026-08-13.json`
+
+**Results (BM25 vs Vector vs Hybrid @ K=10, 62 queries):**
+
+| Metric | BM25 | Vector | Hybrid (50/50) | Δ vs BM25 | Δ vs Vector |
+|---|---|---|---|---|---|
+| NDCG@10 | 0.5007 | **0.6940** | 0.6003 | +0.0996 (+19.9%) | −0.0937 (−13.5%) |
+| MRR | 0.6842 | **0.8688** | 0.8542 | +0.1700 (+24.9%) | −0.0146 (−1.7%) |
+| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | +0.1129 (+13.7%) | −0.0645 (−6.5%) |
+| Precision@10 | 0.6145 | **0.7790** | 0.6823 | +0.0678 (+11.0%) | −0.0967 (−12.4%) |
+| Latency p50 | **24 ms** | 11 ms | 57 ms | +33 ms | +46 ms |
+| Latency p95 | **45 ms** | 135 ms | 90 ms | +45 ms | −45 ms |
+
+**Query-class breakdown (Hybrid vs Vector):**
+
+| Class | n | BM25 NDCG | Vector NDCG | Hybrid NDCG | Hybrid vs Vector |
+|---|---|---|---|---|---|
+| adults_couples | 6 | 0.8483 | 0.8923 | **0.9020** | **+0.010** |
+| multi_constraint | 6 | 0.6169 | 0.7815 | **0.7035** | −0.078 |
+| quiet_peaceful | 5 | 0.5793 | 0.6863 | **0.6801** | −0.006 |
+| luxury | 6 | 0.7026 | 0.7446 | **0.7045** | −0.040 |
+| family | 9 | 0.6243 | 0.7422 | **0.7165** | −0.026 |
+| natural_language | 4 | 0.5279 | 0.6056 | 0.5472 | −0.058 |
+| budget | 5 | 0.4343 | 0.4269 | 0.4577 | +0.031 |
+| nightlife | 5 | 0.3452 | 0.6307 | 0.4559 | −0.175 |
+| activities | 6 | 0.2808 | 0.3837 | 0.3256 | −0.058 |
+| **exact_destination** | 10 | 0.1830 | **0.8392** | 0.4799 | **−0.359** |
+
+**Surprises / observations:**
+
+1. **Hybrid with 50/50 weights regresses from vector across most classes.** The overall NDCG dropped from 0.694 (vector) to 0.600 (hybrid). This contradicts the naive expectation that "combining two good retrievers always helps." The mechanism: min-max normalisation rescales each list independently, but BM25's *relative ordering* within its list still carries information — and for classes where BM25's ordering is wrong, it actively degrades the fused ranking.
+
+2. **exact_destination: the biggest regression (0.84 → 0.48).** This is the clearest illustration of the mixing problem. For destination queries like "hotels in Tenerife", BM25 scores near-randomly (NDCG=0.18) because destination names rarely appear in hotel descriptions. Giving those random BM25 scores 50% weight pulls highly ranked vector results down and promotes incorrectly ranked BM25 results. Adding bad signal is worse than no signal.
+
+3. **Nightlife regresses significantly (0.63 → 0.46).** Same mechanism: BM25 scores nightlife queries poorly (0.35), and 50% weight given to random BM25 rankings dilutes the vector advantage.
+
+4. **adults_couples is the one class where hybrid *beats* vector (0.892 → 0.902).** This is a class where BM25 also performs well (0.848) — "adults only", "spa", "luxury" are discriminative terms that appear in both descriptions and the query. When both retrievers agree on ranking, fusion concentrates score on the overlapping top documents and improves precision.
+
+5. **Hybrid p50 latency = 57 ms** (vs BM25 24 ms, vector 11 ms). Latency is the sum of two sequential queries (~24 ms + ~11 ms) plus fusion (~1 ms). For production, running both queries concurrently would reduce this to max(lex, vec) + fusion ≈ 25 ms.
+
+6. **Hybrid p95 = 90 ms** (vs vector 135 ms, BM25 45 ms). The p95 is lower than vector alone — likely because ANN's worst-case (deeply explored HNSW graph) is bounded by `candidate_k=50`, and lexical's p95 is also bounded. The joint distribution smooths the tail.
+
+**Key finding:** Naive 50/50 weighted-sum fusion does not beat the best individual retriever (vector, NDCG=0.694). The fundamental problem is that min-max normalisation cannot fix a retriever that produces meaningless scores for a given query class — it only scales scores, not fixes their ordering. **Weight tuning** (e.g., 0.3 BM25 / 0.7 vector) would help for this dataset. **Reciprocal Rank Fusion (RRF, Milestone 7)** avoids this problem entirely by fusing on ranks rather than scores: a document ranked 50th by BM25 contributes the same small amount regardless of its BM25 score value.
+
+**Next question this raises:**
+- Will RRF (rank-based fusion) avoid the score-scale problem and outperform weighted-sum? Hypothesis: yes — RRF is robust to score meaninglessness because it only cares about *position* in the list, not *score magnitude*. (Milestone 7)
+- What lexical/vector weight ratio maximises hybrid NDCG on this dataset? The data suggest ~0.25/0.75 or 0.2/0.8 would reduce the regression on `exact_destination`. (Future: hyperparameter sweep)

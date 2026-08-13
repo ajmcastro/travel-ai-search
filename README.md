@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 5 — Embeddings and vector retrieval
+## Current status: Milestone 6 — Hybrid retrieval
 
 | # | Milestone | Status |
 |---|---|---|
@@ -15,8 +15,8 @@ An educational, production-quality project demonstrating modern AI search archit
 | 2 | OpenSearch mappings and ingestion | ✅ Complete |
 | 3 | BM25 lexical retrieval | ✅ Complete |
 | 4 | Evaluation framework and BM25 baseline | ✅ Complete |
-| 5 | Embeddings and vector retrieval | ✅ **Complete** |
-| 6 | Hybrid retrieval | Pending |
+| 5 | Embeddings and vector retrieval | ✅ Complete |
+| 6 | Hybrid retrieval | ✅ **Complete** |
 | 7 | RRF and alternative fusion | Pending |
 | 8 | Cross-encoder reranking | Pending |
 | 9 | Query understanding and structured constraints | Pending |
@@ -27,22 +27,20 @@ An educational, production-quality project demonstrating modern AI search archit
 | 14 | Graph-enhanced retrieval prototype | Pending |
 | 15 | Production API, observability, resilience | Pending |
 
-### BM25 vs Vector baseline (K=10, 62 queries, 10 query classes)
+### BM25 vs Vector vs Hybrid (K=10, 62 queries, 10 query classes)
 
-| Metric | BM25 | Vector | Δ |
+| Metric | BM25 | Vector | Hybrid (50/50) |
 |---|---|---|---|
-| NDCG@10 | 0.5007 | **0.6940** | +38.6% |
-| MRR | 0.6842 | **0.8688** | +27.0% |
-| HitRate@10 | 0.8226 | **1.0000** | +21.6% |
-| Precision@10 | 0.6145 | **0.7790** | +26.8% |
-| Latency p50 | 24 ms | 11 ms | faster |
-| Latency p95 | 45 ms | 135 ms | more variable |
+| NDCG@10 | 0.5007 | **0.6940** | 0.6003 |
+| MRR | 0.6842 | **0.8688** | 0.8542 |
+| HitRate@10 | 0.8226 | **1.0000** | 0.9355 |
+| Precision@10 | 0.6145 | **0.7790** | 0.6823 |
+| Latency p50 | **24 ms** | 11 ms | 57 ms |
+| Latency p95 | **45 ms** | 135 ms | 90 ms |
 
-**Key findings:**
-- Vector retrieval completely closes the destination gap: `exact_destination` NDCG jumped from 0.18 → 0.84 (+358%). Embedding models encode place names as geometric concepts; "Tenerife" is close to Canary Island hotels even without the word in their descriptions.
-- HitRate@10 = 1.000 for vector — every query in the golden set now finds at least one relevant hotel.
-- BM25 remains competitive for exact-term queries and has lower p95 latency.
-- Hybrid retrieval (M6) will aim to combine both.
+**Key findings (cumulative):**
+- Vector (M5): NDCG +38.6% vs BM25; `exact_destination` NDCG jumped from 0.18 → 0.84 (+358%); HitRate = 1.000.
+- Hybrid (M6) — weighted sum, 50/50: overall NDCG is between BM25 and vector (0.60). A key insight: naive 50/50 fusion can *regress* from the best individual retriever when one retriever produces meaningless scores for a query class. `exact_destination` NDCG drops from 0.84 (vector) to 0.48 because 50% BM25 weight dilutes the strong vector signal with near-random BM25 rankings. Classes where BM25 also performs well (e.g., `adults_couples`) benefit from hybrid. This motivates rank-based fusion (RRF, Milestone 7), which is robust to score magnitude.
 
 Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
@@ -139,6 +137,9 @@ make evaluate
 
 # Run vector evaluation (requires: make generate-embeddings first)
 uv run python scripts/evaluate.py --strategy vector
+
+# Run hybrid evaluation (requires: make generate-embeddings first)
+uv run python scripts/evaluate.py --strategy hybrid
 ```
 
 ---
@@ -157,6 +158,7 @@ Available endpoints:
 | `GET /health` | OpenSearch connectivity check |
 | `GET /search/lexical?q=...` | BM25 lexical search |
 | `GET /search/vector?q=...` | Dense vector (ANN) search |
+| `GET /search/hybrid?q=...` | Hybrid BM25 + vector (weighted sum fusion) |
 
 Example searches:
 
@@ -166,6 +168,9 @@ curl "localhost:8000/search/lexical?q=family+beach+resort&country=Spain&family_f
 
 # Vector — semantic match (finds Tenerife hotels even without the word in description)
 curl "localhost:8000/search/vector?q=sunny+beach+holiday+in+the+Canary+Islands"
+
+# Hybrid — combines BM25 and vector via weighted sum fusion
+curl "localhost:8000/search/hybrid?q=romantic+adults-only+resort+with+infinity+pool&country=Spain&adults_only=true"
 ```
 
 Response shape:
@@ -208,6 +213,9 @@ Supported query parameters:
 | `max_price` | float | Maximum price per person (GBP) |
 | `month` | string | Available month (e.g. `July`) |
 | `airport` | string | Departure airport code (e.g. `MAN`) |
+| `candidate_k` | int | (hybrid only) Candidates per retriever before fusion (default: 50) |
+| `lexical_weight` | float | (hybrid only) BM25 score weight in fusion (default: 0.5) |
+| `vector_weight` | float | (hybrid only) Vector score weight in fusion (default: 0.5) |
 
 ---
 
@@ -272,8 +280,11 @@ src/travel_ai_search/
 │   ├── index.py             # OpenSearch index mapping and CRUD (knn_vector)
 │   └── ingestor.py          # Bulk ingestion: load_products(), ingest()
 ├── retrieval/
+│   ├── types.py             # Shared Hit dataclass (imported by all retrieval modules)
+│   ├── fusion.py            # build_filter_clauses(), _normalize_scores(), fuse_results()
 │   ├── lexical.py           # BM25 multi-match search: lexical_search()
-│   └── vector.py            # ANN search: vector_search(), _build_vector_query()
+│   ├── vector.py            # ANN search: vector_search(), _build_vector_query()
+│   └── hybrid.py            # Hybrid orchestration: hybrid_search(), HybridSearchParams
 └── infrastructure/
     └── opensearch.py        # OpenSearch client factory
 
@@ -283,7 +294,7 @@ scripts/
 ├── ingest_data.py           # Bulk-index dataset into OpenSearch
 ├── generate_embeddings.py   # Offline: embed all hotels, update OpenSearch
 ├── build_golden_dataset.py  # Build golden evaluation dataset (one-time)
-├── evaluate.py              # Run evaluation: --strategy bm25 | vector
+├── evaluate.py              # Run evaluation: --strategy bm25 | vector | hybrid
 └── healthcheck.py           # Verify OpenSearch connectivity
 
 data/
@@ -294,8 +305,8 @@ data/
     └── results/             # JSON evaluation results per run
 
 tests/
-├── unit/                    # No infrastructure required (202 tests)
-└── integration/             # Requires OpenSearch running (69 tests)
+├── unit/                    # No infrastructure required (230 tests)
+└── integration/             # Requires OpenSearch running (85 tests)
 ```
 
 ---

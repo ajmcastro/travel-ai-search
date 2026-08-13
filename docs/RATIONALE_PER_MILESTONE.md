@@ -752,3 +752,87 @@ def test_vector_endpoint(mock_create): ...
 | Latency p95 | 45 ms | 135 ms | more variable |
 
 The most important result: the destination gap that cost BM25 NDCG=0.0 on 5 queries is fully resolved by vector retrieval. Hybrid retrieval (M6–7) will seek to combine the precision of BM25 for exact-match queries with the recall of vector search.
+
+---
+
+## Milestone 6 — Hybrid retrieval
+
+### What we added
+
+- `src/travel_ai_search/retrieval/types.py` — shared `Hit` dataclass; extracted from `lexical.py` to break a circular import between `fusion.py` and `lexical.py`.
+- `src/travel_ai_search/retrieval/fusion.py` — new module with three components:
+  - `build_filter_clauses(**kwargs)` — the single authoritative source for OpenSearch filter clause construction; previously duplicated in `lexical.py` and `vector.py`.
+  - `_normalize_scores(hits) → dict[id, (norm_score, source)]` — min-max normalisation, maps a ranked list to [0, 1].
+  - `fuse_results(lex_hits, vec_hits, *, lexical_weight, vector_weight, top_k) → list[Hit]` — pure function (no I/O); performs union, weighted combination, sort, and truncation.
+- `src/travel_ai_search/retrieval/hybrid.py` — orchestrates both retrievers and fusion; `HybridSearchParams`, `HybridSearchResult`, `hybrid_search()`.
+- `GET /search/hybrid` endpoint with per-retriever timing in the response.
+- `hybrid` strategy in `scripts/evaluate.py`.
+- Unit tests for all pure functions in `fusion.py`; integration tests for filters, weights, and semantic quality.
+
+### Concepts introduced
+
+#### The score normalisation problem
+
+BM25 and cosine similarity live in incompatible numeric ranges. BM25 scores are corpus- and query-dependent — a BM25 score of 12.4 means "more relevant than a score of 8.2 given this corpus and this query", but it carries no absolute meaning. Cosine similarity scores are in [0, 1] (for L2-normalised vectors). If you add them directly, BM25 dominates: its larger numeric range swamps the cosine signal.
+
+**Min-max normalisation** maps each list independently to [0, 1]:
+
+```
+norm(score) = (score − min_score) / (max_score − min_score)
+```
+
+Edge cases: empty list → empty dict; single document → 1.0; all identical scores → 1.0 (denominator = 0 → clamp). After normalisation, both lists are on the same scale and can be combined linearly.
+
+#### Weighted-sum fusion
+
+```
+combined_score = lexical_weight × norm_bm25 + vector_weight × norm_vector
+```
+
+where `norm_x = 0.0` for documents absent from retriever x's results. Documents found by both retrievers (and ranked highly by both) will score highest; those found by only one retriever are penalised — their maximum possible score is `max_weight × 1.0`.
+
+The weights do not need to sum to 1.0 (they are applied to already-normalised scores), but conceptually keeping them normalised makes them interpretable as a convex combination.
+
+#### Candidate pool (`candidate_k > top_k`)
+
+Each retriever fetches `candidate_k=50` documents. Fusion selects the best `top_k=10` from up to 100 unique candidates. The larger pool is necessary because:
+
+- A document ranked 11th by BM25 but 1st by vector should win fusion; it would be invisible with `candidate_k=top_k=10`.
+- Fusion can promote documents that one retriever ranked just outside top-k if the other retriever strongly endorses them.
+- Setting `candidate_k` too high increases latency; too low misses re-ranking opportunities.
+
+#### Missing-retriever penalty (0.0 score for absent documents)
+
+Documents found by only one retriever receive 0.0 for the missing side. This is a conservative choice that reflects lower confidence: if the embedding space says a document is semantically close but BM25 gives it near-zero, the document may be a false positive; if BM25 ranks it high but vector doesn't, the keyword match may be coincidental. Documents found by both retrievers — both signal agreement — score highest.
+
+An alternative: use a floor score (e.g., 0.0 penalises less than −∞). Another: treat absence as a rank-penalty rather than a score penalty (this is what RRF does, Milestone 7).
+
+#### Circular import and the shared types module
+
+Putting `Hit` in `lexical.py` and `build_filter_clauses` in `fusion.py` creates a cycle: `fusion.py` imported `Hit` from `lexical.py`, which imported `build_filter_clauses` from `fusion.py`. Python's module initialisation fails on partially initialised modules.
+
+The fix: `types.py` holds the shared `Hit` dataclass. Both `lexical.py` and `fusion.py` import from `types.py`. `lexical.py` still re-exports `Hit` in its namespace for backwards compatibility (existing imports like `from travel_ai_search.retrieval.lexical import Hit` continue to work).
+
+### Design decisions
+
+| Decision | Choice | Alternatives considered | Rationale |
+|---|---|---|---|
+| Fusion strategy | Min-max normalised weighted sum | RRF, WAND | Min-max is transparent and unit-testable; illustrates the score normalisation problem concretely. RRF deferred to M7 as a contrast. |
+| Client-side vs server-side hybrid | Client-side | OpenSearch native hybrid pipeline | Server-side requires index-time pipeline setup and the hybrid plugin; client-side is self-contained and fully inspectable. |
+| Candidate pool | `candidate_k=50`, final `top_k=10` | `candidate_k=top_k` | Larger pool allows fusion to surface documents ranked 11–50 by one retriever when the other retriever strongly endorses them. |
+| Filter propagation | Both retrievers receive the same filter set | Filter only lexical or only vector | Filters are hard constraints; they must apply to all candidates regardless of retrieval path. |
+| Timing metadata | `took_ms`, `lexical_took_ms`, `vector_took_ms` in response | Total only | Per-stage timing exposes where latency is spent; useful for deciding when to parallelise the two queries. |
+| Sequential vs concurrent retrieval | Sequential | `asyncio.gather` / threads | Simpler code for an educational project. In production, running both queries concurrently would reduce p50 to `max(lex, vec) + fusion ≈ 25 ms`. |
+
+### Results summary (M6)
+
+| Metric | BM25 | Vector | Hybrid (50/50) | Notes |
+|---|---|---|---|---|
+| NDCG@10 | 0.5007 | **0.6940** | 0.6003 | Hybrid regresses from vector |
+| MRR | 0.6842 | **0.8688** | 0.8542 | Near-vector quality |
+| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | Better than BM25, below vector |
+| exact_destination NDCG@10 | 0.1830 | **0.8392** | 0.4799 | Bad BM25 signals dilute vector |
+| Latency p50 | 24 ms | 11 ms | 57 ms | Two sequential queries |
+| Latency p95 | 45 ms | 135 ms | 90 ms | Lower tail than vector alone |
+
+**Core learning:** Naive 50/50 weighted-sum fusion does not beat the best individual retriever when one retriever produces meaningless scores for a query class. Adding a bad signal (BM25's near-random ordering for destination queries) at 50% weight degrades results. This motivates RRF (Milestone 7), which is rank-based and robust to score magnitude.

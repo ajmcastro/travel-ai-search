@@ -35,6 +35,13 @@ class Settings(BaseSettings):
     embedding_model_name: str = "all-MiniLM-L6-v2"
     embedding_dimension: int = 384
 
+    # Hybrid retrieval (Milestone 6)
+    # lexical_weight + vector_weight need not sum to 1.0; they are applied to
+    # independently min-max-normalised scores, so the ratio is what matters.
+    hybrid_lexical_weight: float = 0.5
+    hybrid_vector_weight: float = 0.5
+    hybrid_candidate_k: int = 50
+
 
 @lru_cache
 def get_settings() -> Settings:
