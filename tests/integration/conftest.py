@@ -11,12 +11,15 @@ from collections.abc import Iterator
 
 import pytest
 from opensearchpy import OpenSearch
+from opensearchpy.helpers import bulk  # type: ignore[import-untyped]
 
-from travel_ai_search.domain.models import TravelProduct
+from travel_ai_search.domain.models import TravelProduct, build_embedding_text
+from travel_ai_search.embeddings.local import LocalEmbeddingProvider
 from travel_ai_search.ingestion.index import INDEX_BODY
 from travel_ai_search.ingestion.ingestor import ingest
 
 _LEXICAL_TEST_INDEX = "travel_hotels_lexical_test"
+_VECTOR_TEST_INDEX = "travel_hotels_vector_test"
 
 # ── Curated test dataset ──────────────────────────────────────────────────────
 # Designed so that filter tests can assert exact document counts without
@@ -216,3 +219,49 @@ def lexical_test_index(opensearch_client: OpenSearch) -> Iterator[str]:
     yield _LEXICAL_TEST_INDEX
     if opensearch_client.indices.exists(index=_LEXICAL_TEST_INDEX):
         opensearch_client.indices.delete(index=_LEXICAL_TEST_INDEX)
+
+
+@pytest.fixture(scope="session")
+def embedding_provider() -> LocalEmbeddingProvider:
+    """Session-scoped LocalEmbeddingProvider.  Model is loaded once per session."""
+    return LocalEmbeddingProvider()
+
+
+@pytest.fixture(scope="session")
+def vector_test_index(
+    opensearch_client: OpenSearch,
+    embedding_provider: LocalEmbeddingProvider,
+) -> Iterator[str]:
+    """Session-scoped knn index pre-loaded with curated hotels AND their embeddings.
+
+    Build steps:
+      1. Create the index (knn=True mapping, identical to production).
+      2. Ingest the curated hotels without embeddings (plain document fields).
+      3. Generate real embeddings for each hotel and update via bulk update.
+      4. Refresh so the HNSW graph is built and queries return results.
+
+    Tests must only READ; they must not write to this index.
+    """
+    if opensearch_client.indices.exists(index=_VECTOR_TEST_INDEX):
+        opensearch_client.indices.delete(index=_VECTOR_TEST_INDEX)
+    opensearch_client.indices.create(index=_VECTOR_TEST_INDEX, body=INDEX_BODY)
+    ingest(opensearch_client, _CURATED_HOTELS, index=_VECTOR_TEST_INDEX)
+
+    texts = [build_embedding_text(h) for h in _CURATED_HOTELS]
+    vectors = embedding_provider.embed_batch(texts)
+    actions = [
+        {
+            "_op_type": "update",
+            "_index": _VECTOR_TEST_INDEX,
+            "_id": hotel.id,
+            "doc": {"embedding_vector": vector},
+        }
+        for hotel, vector in zip(_CURATED_HOTELS, vectors)
+    ]
+    bulk(opensearch_client, actions, raise_on_error=True)
+    opensearch_client.indices.refresh(index=_VECTOR_TEST_INDEX)
+
+    yield _VECTOR_TEST_INDEX
+
+    if opensearch_client.indices.exists(index=_VECTOR_TEST_INDEX):
+        opensearch_client.indices.delete(index=_VECTOR_TEST_INDEX)

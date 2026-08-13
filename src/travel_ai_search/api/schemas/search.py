@@ -5,6 +5,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict
 
 from travel_ai_search.retrieval.lexical import LexicalSearchResult
+from travel_ai_search.retrieval.vector import VectorSearchResult
 
 
 class SearchHit(BaseModel):
@@ -67,3 +68,23 @@ class LexicalSearchResponse(BaseModel):
             for name, agg in result.raw_aggregations.items()
         }
         return cls(hits=hits, total=result.total, took_ms=result.took_ms, facets=facets)
+
+
+class VectorSearchResponse(BaseModel):
+    """Response schema for the vector (ANN) search endpoint.
+
+    No facets — aggregations alongside a knn query are supported by
+    OpenSearch but deferred to the hybrid milestone for simplicity.
+    """
+
+    hits: list[SearchHit]
+    total: int
+    took_ms: int
+
+    @classmethod
+    def from_result(cls, result: VectorSearchResult) -> VectorSearchResponse:
+        hits = [
+            SearchHit.model_validate({"id": hit.id, "score": hit.score, **hit.source})
+            for hit in result.hits
+        ]
+        return cls(hits=hits, total=result.total, took_ms=result.took_ms)

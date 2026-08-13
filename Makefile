@@ -95,6 +95,13 @@ create-index: ## Create OpenSearch index with mappings  [Milestone 2]
 ingest: ## Ingest travel dataset into OpenSearch  [Milestone 2]
 	uv run python scripts/ingest_data.py
 
+.PHONY: generate-embeddings
+generate-embeddings: ## Generate dense embeddings and update OpenSearch  [Milestone 5]
+	uv run python scripts/generate_embeddings.py
+
+.PHONY: embed
+embed: generate-embeddings ## Alias for generate-embeddings
+
 # ── Evaluation ─────────────────────────────────────────────────────────────────
 
 .PHONY: evaluate

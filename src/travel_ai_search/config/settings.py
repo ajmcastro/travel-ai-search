@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     # Search
     top_k: int = 10
 
+    # Embeddings
+    # Change embedding_model_name to switch models, but also update
+    # embedding_dimension to match and recreate the index (dimension is immutable).
+    embedding_model_name: str = "all-MiniLM-L6-v2"
+    embedding_dimension: int = 384
+
 
 @lru_cache
 def get_settings() -> Settings:

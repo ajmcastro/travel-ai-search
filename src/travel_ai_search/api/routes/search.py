@@ -5,10 +5,12 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 from opensearchpy import OpenSearch
 
-from travel_ai_search.api.deps import get_os_client, get_settings
-from travel_ai_search.api.schemas.search import LexicalSearchResponse
+from travel_ai_search.api.deps import get_embedding_provider, get_os_client, get_settings
+from travel_ai_search.api.schemas.search import LexicalSearchResponse, VectorSearchResponse
 from travel_ai_search.config.settings import Settings
+from travel_ai_search.embeddings.base import EmbeddingProvider
 from travel_ai_search.retrieval.lexical import LexicalSearchParams, lexical_search
+from travel_ai_search.retrieval.vector import VectorSearchParams, vector_search
 
 router = APIRouter(tags=["Search"])
 
@@ -51,3 +53,44 @@ def lexical_search_endpoint(
     )
     result = lexical_search(client, params, index=settings.opensearch_index_name)
     return LexicalSearchResponse.from_result(result)
+
+
+@router.get("/vector", response_model=VectorSearchResponse)
+def vector_search_endpoint(
+    q: str = Query("", description="Natural-language search query"),
+    top_k: int = Query(None, ge=1, le=100, description="Maximum results to return"),
+    country: str | None = Query(None, description="Filter by country name"),
+    destination: str | None = Query(None, description="Filter by exact destination name"),
+    family_friendly: bool | None = Query(None, description="Filter to family-friendly hotels"),
+    adults_only: bool | None = Query(None, description="Filter to adults-only hotels"),
+    min_stars: int | None = Query(None, ge=1, le=5, description="Minimum star rating"),
+    max_price: float | None = Query(None, gt=0, description="Maximum price per person (GBP)"),
+    month: str | None = Query(None, description="Filter to hotels available in this month"),
+    airport: str | None = Query(None, description="Filter by departure airport IATA code"),
+    client: OpenSearch = Depends(get_os_client),
+    provider: EmbeddingProvider = Depends(get_embedding_provider),
+    settings: Settings = Depends(get_settings),
+) -> VectorSearchResponse:
+    """Dense vector (ANN) search using sentence-transformer embeddings and HNSW.
+
+    The query is encoded into a 384-dimensional vector and compared against
+    all indexed hotel embeddings using approximate nearest-neighbour search.
+    Semantically similar hotels are returned even with no keyword overlap.
+
+    Example:
+        GET /search/vector?q=quiet+adults+retreat+near+the+sea&country=Spain
+    """
+    params = VectorSearchParams(
+        query=q,
+        top_k=top_k if top_k is not None else settings.top_k,
+        country=country,
+        destination=destination,
+        family_friendly=family_friendly,
+        adults_only=adults_only,
+        min_star_rating=min_stars,
+        max_price=max_price,
+        month=month,
+        airport=airport,
+    )
+    result = vector_search(client, provider, params, index=settings.opensearch_index_name)
+    return VectorSearchResponse.from_result(result)

@@ -8,6 +8,7 @@ dependencies = [
     "fastapi>=0.141.1",
     "opensearch-py>=2.7.0",
     "pydantic-settings>=2.6.0",
+    "sentence-transformers>=5.7.0",
     "uvicorn>=0.52.2",
 ]
 

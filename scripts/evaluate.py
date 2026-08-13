@@ -1,9 +1,10 @@
 """Evaluation CLI — runs retrieval strategies against the golden dataset.
 
 Usage:
-    uv run python scripts/evaluate.py                   # BM25 only (default)
+    uv run python scripts/evaluate.py                      # BM25 (default)
+    uv run python scripts/evaluate.py --strategy vector    # Vector ANN
     uv run python scripts/evaluate.py --strategy bm25
-    uv run python scripts/evaluate.py --k 10 --no-save  # skip JSON output
+    uv run python scripts/evaluate.py --k 10 --no-save     # skip JSON output
     uv run python scripts/evaluate.py --golden data/evaluation/golden_queries.jsonl
 
 Output:
@@ -24,10 +25,12 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from travel_ai_search.config.settings import get_settings
+from travel_ai_search.embeddings.local import LocalEmbeddingProvider
 from travel_ai_search.evaluation.dataset import load_dataset
 from travel_ai_search.evaluation.evaluator import EvaluationReport, evaluate
 from travel_ai_search.infrastructure.opensearch import create_client
 from travel_ai_search.retrieval.lexical import LexicalSearchParams, lexical_search
+from travel_ai_search.retrieval.vector import VectorSearchParams, vector_search
 
 GOLDEN_DEFAULT = Path("data/evaluation/golden_queries.jsonl")
 RESULTS_DIR = Path("data/evaluation/results")
@@ -36,7 +39,7 @@ RESULTS_DIR = Path("data/evaluation/results")
 # ── Strategy factories ────────────────────────────────────────────────────────
 
 
-def make_bm25_fn(client: Any, index: str) -> Any:
+def make_bm25_fn(client: Any, index: str, **_: Any) -> Any:
     """Return a SearchFn that calls BM25 lexical search."""
 
     def search(query_text: str, top_k: int, filters: dict[str, Any]) -> list[str]:
@@ -47,8 +50,25 @@ def make_bm25_fn(client: Any, index: str) -> Any:
     return search
 
 
+def make_vector_fn(client: Any, index: str, embedding_provider: Any = None, **_: Any) -> Any:
+    """Return a SearchFn that calls dense vector (ANN) search.
+
+    The embedding_provider is loaded once and reused for all queries in the run.
+    If not provided (e.g. from a strategy dict), it is created from settings.
+    """
+    provider = embedding_provider
+
+    def search(query_text: str, top_k: int, filters: dict[str, Any]) -> list[str]:
+        params = VectorSearchParams(query=query_text, top_k=top_k, **filters)
+        result = vector_search(client, provider, params, index=index)
+        return [hit.id for hit in result.hits]
+
+    return search
+
+
 STRATEGIES: dict[str, Any] = {
     "bm25": make_bm25_fn,
+    "vector": make_vector_fn,
 }
 
 
@@ -168,9 +188,20 @@ def main(argv: list[str] | None = None) -> None:
     dataset = load_dataset(args.golden)
     print(f"  {len(dataset)} queries across {len(dataset.by_class())} classes")
 
+    # Load embedding model if needed
+    embedding_provider = None
+    if args.strategy == "vector":
+        print(f"\nLoading embedding model '{settings.embedding_model_name}' …")
+        embedding_provider = LocalEmbeddingProvider(settings.embedding_model_name)
+        print(f"  dimension={embedding_provider.dimension}")
+
     # Build search function
     factory = STRATEGIES[args.strategy]
-    search_fn = factory(client, settings.opensearch_index_name)
+    search_fn = factory(
+        client,
+        settings.opensearch_index_name,
+        embedding_provider=embedding_provider,
+    )
 
     # Evaluate
     print(f"\nRunning evaluation: strategy={args.strategy}, k={args.k} …")

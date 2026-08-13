@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 4 — Evaluation framework and BM25 baseline
+## Current status: Milestone 5 — Embeddings and vector retrieval
 
 | # | Milestone | Status |
 |---|---|---|
@@ -14,8 +14,8 @@ An educational, production-quality project demonstrating modern AI search archit
 | 1 | Synthetic travel dataset | ✅ Complete |
 | 2 | OpenSearch mappings and ingestion | ✅ Complete |
 | 3 | BM25 lexical retrieval | ✅ Complete |
-| 4 | Evaluation framework and BM25 baseline | ✅ **Complete** |
-| 5 | Embeddings and vector retrieval | Pending |
+| 4 | Evaluation framework and BM25 baseline | ✅ Complete |
+| 5 | Embeddings and vector retrieval | ✅ **Complete** |
 | 6 | Hybrid retrieval | Pending |
 | 7 | RRF and alternative fusion | Pending |
 | 8 | Cross-encoder reranking | Pending |
@@ -27,20 +27,24 @@ An educational, production-quality project demonstrating modern AI search archit
 | 14 | Graph-enhanced retrieval prototype | Pending |
 | 15 | Production API, observability, resilience | Pending |
 
-### BM25 baseline (Milestone 4 results, K=10, 62 queries, 10 query classes)
+### BM25 vs Vector baseline (K=10, 62 queries, 10 query classes)
 
-| Metric | BM25 |
-|---|---|
-| NDCG@10 | 0.5007 |
-| MRR | 0.6842 |
-| HitRate@10 | 0.8226 |
-| Precision@10 | 0.6145 |
-| Latency p50 | 24 ms |
-| Latency p95 | 45 ms |
+| Metric | BM25 | Vector | Δ |
+|---|---|---|---|
+| NDCG@10 | 0.5007 | **0.6940** | +38.6% |
+| MRR | 0.6842 | **0.8688** | +27.0% |
+| HitRate@10 | 0.8226 | **1.0000** | +21.6% |
+| Precision@10 | 0.6145 | **0.7790** | +26.8% |
+| Latency p50 | 24 ms | 11 ms | faster |
+| Latency p95 | 45 ms | 135 ms | more variable |
 
-**Key finding:** BM25 excels at concept-rich queries (`adults_couples` NDCG=0.85, `luxury` NDCG=0.70) but fails on exact-destination queries (`exact_destination` NDCG=0.18). The destination field is stored as a keyword and not visible to BM25 multi-match — fixing this is the primary motivation for vector retrieval (Milestone 5).
+**Key findings:**
+- Vector retrieval completely closes the destination gap: `exact_destination` NDCG jumped from 0.18 → 0.84 (+358%). Embedding models encode place names as geometric concepts; "Tenerife" is close to Canary Island hotels even without the word in their descriptions.
+- HitRate@10 = 1.000 for vector — every query in the golden set now finds at least one relevant hotel.
+- BM25 remains competitive for exact-term queries and has lower p95 latency.
+- Hybrid retrieval (M6) will aim to combine both.
 
-Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) and [`data/evaluation/results/bm25_2026-08-13.json`](data/evaluation/results/bm25_2026-08-13.json).
+Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
 ---
 
@@ -92,11 +96,15 @@ These steps build the full dataset and index it into OpenSearch.
 # Generate the synthetic hotel dataset (~5,470 hotels, deterministic seed)
 make generate-data
 
-# Create the OpenSearch index with the correct field mappings
+# Create the OpenSearch index with the correct field mappings (knn enabled)
 make create-index
 
 # Bulk-index all hotels into OpenSearch
 make ingest
+
+# Generate dense embeddings and write to OpenSearch (Milestone 5+)
+# Downloads all-MiniLM-L6-v2 (~80 MB) on first run; ~14 s for 5,470 hotels
+make generate-embeddings
 ```
 
 Expected output from `make ingest`:
@@ -115,6 +123,7 @@ To recreate the index from scratch (drops all indexed data):
 ```bash
 uv run python scripts/create_index.py --recreate
 make ingest
+make generate-embeddings
 ```
 
 ---
@@ -125,27 +134,11 @@ make ingest
 # Build the golden relevance dataset (one-time; produces 62 queries, 48,675 judgments)
 uv run python scripts/build_golden_dataset.py
 
-# Run the BM25 evaluation (prints table + saves JSON to data/evaluation/results/)
+# Run BM25 evaluation (prints table + saves JSON to data/evaluation/results/)
 make evaluate
-```
 
-Full evaluation run output:
-```
-Strategy: BM25   |   @K=10   |   62 queries
-
-OVERALL
-  NDCG@K             0.5007  ██████████░░░░░░░░░░
-  MRR                0.6842  ██████████████░░░░░░
-  HitRate@K          0.8226  ████████████████░░░░
-  Precision@K        0.6145  ████████████░░░░░░░░
-
-BY QUERY CLASS
-  Class                    n    NDCG     MRR      HR       P
-  adults_couples           6  0.8483  1.0000  1.0000  1.0000
-  luxury                   6  0.7026  0.9167  1.0000  0.8667
-  multi_constraint         6  0.6169  1.0000  1.0000  0.8667
-  ...
-  exact_destination       10  0.1830  0.2692  0.6000  0.2000
+# Run vector evaluation (requires: make generate-embeddings first)
+uv run python scripts/evaluate.py --strategy vector
 ```
 
 ---
@@ -163,11 +156,16 @@ Available endpoints:
 |---|---|
 | `GET /health` | OpenSearch connectivity check |
 | `GET /search/lexical?q=...` | BM25 lexical search |
+| `GET /search/vector?q=...` | Dense vector (ANN) search |
 
-Example search with filters:
+Example searches:
 
 ```bash
+# BM25 — keyword match
 curl "localhost:8000/search/lexical?q=family+beach+resort&country=Spain&family_friendly=true&max_price=1000"
+
+# Vector — semantic match (finds Tenerife hotels even without the word in description)
+curl "localhost:8000/search/vector?q=sunny+beach+holiday+in+the+Canary+Islands"
 ```
 
 Response shape:
@@ -216,16 +214,17 @@ Supported query parameters:
 ## Development commands
 
 ```bash
-make check            # full quality gate: lint + format check + types + unit tests
-make test             # unit tests only (no infrastructure required)
-make test-integration # integration tests (requires: make up + make ingest)
-make test-all         # unit + integration
-make lint             # ruff check
-make lint-fix         # ruff check --fix
-make fmt              # ruff format
-make typecheck        # mypy
-make serve            # FastAPI dev server
-make evaluate         # run BM25 evaluation against golden dataset
+make check              # full quality gate: lint + format check + types + unit tests
+make test               # unit tests only (no infrastructure required)
+make test-integration   # integration tests (requires: make up + make ingest)
+make test-all           # unit + integration
+make lint               # ruff check
+make lint-fix           # ruff check --fix
+make fmt                # ruff format
+make typecheck          # mypy
+make serve              # FastAPI dev server
+make evaluate           # run BM25 evaluation against golden dataset
+make generate-embeddings # generate dense embeddings for all hotels (Milestone 5+)
 ```
 
 ---
@@ -244,6 +243,8 @@ Copy `.env.example` to `.env` (or run `make env`) and adjust as needed. All sett
 | `TOP_K` | `10` | Default result count for search and evaluation |
 | `LOG_LEVEL` | `INFO` | Application log level |
 | `ENVIRONMENT` | `development` | `development` or `production` |
+| `EMBEDDING_MODEL_NAME` | `all-MiniLM-L6-v2` | Sentence-transformers model for dense embeddings |
+| `EMBEDDING_DIMENSION` | `384` | Embedding dimension (must match model and index mapping) |
 
 ---
 
@@ -252,32 +253,37 @@ Copy `.env.example` to `.env` (or run `make env`) and adjust as needed. All sett
 ```
 src/travel_ai_search/
 ├── api/
-│   ├── app.py               # FastAPI app with lifespan (OpenSearch client)
+│   ├── app.py               # FastAPI app, lifespan (OpenSearch + embedding provider)
 │   ├── deps.py              # FastAPI dependency injection
 │   └── routes/
-│       └── search.py        # GET /health, GET /search/lexical
+│       └── search.py        # GET /search/lexical, GET /search/vector
 ├── config/
 │   └── settings.py          # Pydantic settings, loaded from env vars / .env
 ├── domain/
 │   └── models.py            # TravelProduct model + build_embedding_text()
+├── embeddings/
+│   ├── base.py              # EmbeddingProvider Protocol
+│   └── local.py             # LocalEmbeddingProvider (sentence-transformers)
 ├── evaluation/
 │   ├── dataset.py           # GoldenQuery, GoldenDataset, load_dataset()
 │   ├── evaluator.py         # evaluate(), EvaluationReport, SearchFn type
 │   └── metrics.py           # P@K, Recall@K, HitRate@K, RR, AP, NDCG@K
 ├── ingestion/
-│   ├── index.py             # OpenSearch index mapping and CRUD
+│   ├── index.py             # OpenSearch index mapping and CRUD (knn_vector)
 │   └── ingestor.py          # Bulk ingestion: load_products(), ingest()
 ├── retrieval/
-│   └── lexical.py           # BM25 multi-match search: lexical_search()
+│   ├── lexical.py           # BM25 multi-match search: lexical_search()
+│   └── vector.py            # ANN search: vector_search(), _build_vector_query()
 └── infrastructure/
     └── opensearch.py        # OpenSearch client factory
 
 scripts/
 ├── generate_dataset.py      # Generate synthetic JSONL dataset
-├── create_index.py          # Create OpenSearch index
+├── create_index.py          # Create OpenSearch index (knn enabled)
 ├── ingest_data.py           # Bulk-index dataset into OpenSearch
+├── generate_embeddings.py   # Offline: embed all hotels, update OpenSearch
 ├── build_golden_dataset.py  # Build golden evaluation dataset (one-time)
-├── evaluate.py              # Run evaluation and print results table
+├── evaluate.py              # Run evaluation: --strategy bm25 | vector
 └── healthcheck.py           # Verify OpenSearch connectivity
 
 data/
@@ -288,8 +294,8 @@ data/
     └── results/             # JSON evaluation results per run
 
 tests/
-├── unit/                    # No infrastructure required (172 tests)
-└── integration/             # Requires OpenSearch running (52 tests)
+├── unit/                    # No infrastructure required (202 tests)
+└── integration/             # Requires OpenSearch running (69 tests)
 ```
 
 ---
@@ -310,8 +316,8 @@ The `travel_hotels` index maps each hotel field to the OpenSearch type that best
 | `price_per_person_gbp`, `customer_rating` | `float` | Range queries |
 | `beach_distance_km`, `airport_distance_km` | `float` | Range queries |
 | `family_friendly`, `adults_only` | `boolean` | Boolean filters |
-| `location` | `geo_point` | Geo-distance queries (Milestone 5+) |
-| `embedding_vector` | `knn_vector` (1024-dim) | ANN search (Milestone 5+) |
+| `location` | `geo_point` | Geo-distance queries |
+| `embedding_vector` | `knn_vector` (384-dim, HNSW/lucene) | ANN search (Milestone 5+) |
 
 ---
 

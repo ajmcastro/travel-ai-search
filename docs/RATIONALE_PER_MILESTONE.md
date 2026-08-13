@@ -608,3 +608,147 @@ These constraints mean semantic queries must target what the data actually conta
 | Evaluator granularity | Per-query + by-class + overall | Overall only | Class breakdown reveals where BM25 fails; guides M5 decisions |
 | Metrics implementation | From scratch | `ranx`, `ir-measures` | Educational purpose; full understanding; no dependency |
 | Results persistence | JSONL (dataset) + JSON (results) | SQLite, Parquet | Human-readable; no external database needed; easy to diff |
+
+---
+
+## Milestone 5 — Embeddings and vector retrieval
+
+### What we added
+
+- **`EmbeddingProvider` Protocol** (`embeddings/base.py`) — structural interface with `dimension`, `embed()`, `embed_batch()`.
+- **`LocalEmbeddingProvider`** (`embeddings/local.py`) — wraps `all-MiniLM-L6-v2` via sentence-transformers; L2-normalised outputs, batch encoding.
+- **knn_vector index mapping** — `embedding_vector` field added to `ingestion/index.py` (HNSW, lucene engine, cosinesimil, m=16, ef_construction=128).
+- **`scripts/generate_embeddings.py`** — offline batch pipeline: reads hotels.jsonl, embeds in batches of 64, updates OpenSearch via bulk Update API (~400 docs/s on CPU, ~14 s for 5,470 hotels).
+- **`retrieval/vector.py`** — `VectorSearchParams`, `VectorSearchResult`, pure `_build_vector_query()`, `vector_search()`.
+- **`/search/vector` API endpoint** — same filter parameters as `/search/lexical`; embedding provider injected via `app.state`.
+- **`vector` strategy** in `scripts/evaluate.py` — enables `make evaluate --strategy vector`.
+- **Tests** — 14 embedding unit tests (mocked model), 25 vector retrieval unit tests (pure function), 20 vector search integration tests (real model + real OpenSearch).
+
+### Concepts
+
+#### Dense embeddings
+
+A language model maps a variable-length text string to a fixed-size real-valued vector (384 floats for MiniLM). The key property is that **semantically similar texts are geometrically close** in vector space — no keyword overlap is required. The query "romantic getaway near the sea" and the hotel description "adults-only sanctuary overlooking the ocean" have no words in common but are close neighbours in embedding space.
+
+#### The BM25 destination gap — why it mattered
+
+M4 measurement revealed that BM25 scored NDCG@10 = 0.18 for `exact_destination` queries — the lowest class by far. The root cause: `destination` is stored as a `keyword` field not included in the BM25 multi-match, and regional names like "Tenerife" or "Algarve" rarely appear verbatim in hotel descriptions. BM25 cannot see them. Embedding the hotel's full text (including its destination, region, country, and description) encodes these place names as semantic concepts. A query for "Tenerife" naturally lands near hotels in the Canary Islands. The fix is geometric, not lexical.
+
+#### Cosine similarity and the L2-normalisation trick
+
+Cosine similarity measures the angle between two vectors regardless of magnitude:
+
+```
+cos(θ) = (A · B) / (|A| × |B|)
+```
+
+When both vectors are **L2-normalised** (`|v| = 1.0`), the denominator is always 1, so:
+
+```
+cos(θ) = A · B
+```
+
+The dot product equals cosine similarity. OpenSearch's `cosinesimil` space type does the normalisation automatically, so passing already-L2-normalised vectors from MiniLM (which normalises by default with `normalize_embeddings=True`) is safe.
+
+#### HNSW — Hierarchical Navigable Small Worlds
+
+Exact nearest-neighbour search in 384 dimensions over 5,470 vectors is fast, but at millions of documents it becomes prohibitively slow (O(N) per query). HNSW is an **approximate nearest-neighbour (ANN)** algorithm that builds a multi-layer proximity graph during indexing:
+
+- **Bottom layer** — every node, densely connected to its m=16 nearest neighbours.
+- **Upper layers** — progressively sparser long-range connections, allowing the search to "zoom in" on the target region quickly.
+
+At query time, the traversal starts at the top layer (long strides), descends, and greedily refines until it reaches the ef_search=100 candidate pool in the bottom layer. Recall is ~95% (95% of the time the true nearest neighbour is in the result) with query latency in single-digit milliseconds — a fundamentally different scaling profile than exact search.
+
+Key parameters:
+
+| Parameter | Value | Effect |
+|---|---|---|
+| m | 16 | Edges per node; higher → better recall, more memory |
+| ef_construction | 128 | Build-time candidate pool; higher → better graph, slower build (one-time) |
+| ef_search | 100 | Query-time candidate pool; higher → better recall, slower queries |
+
+#### Offline embedding pipeline — why separate from ingestion
+
+Embedding 5,470 hotels takes ~14 s on a MacBook CPU. Options:
+
+1. **Inline at ingest time** — simpler, but ingestion becomes a slow CPU-bound operation and the BM25 index is unavailable until embedding finishes.
+2. **Offline script** — ingestion (BM25 index) is immediately available; embedding runs separately and can be repeated with a different model without touching ingestion.
+
+The offline approach also mirrors production architectures where embeddings are generated asynchronously (e.g., by a worker queue) and the main ingestion pipeline is not blocked.
+
+#### The `EmbeddingProvider` Protocol — provider abstraction
+
+```python
+@runtime_checkable
+class EmbeddingProvider(Protocol):
+    @property
+    def dimension(self) -> int: ...
+    def embed(self, text: str) -> list[float]: ...
+    def embed_batch(self, texts: list[str]) -> list[list[float]]: ...
+```
+
+Python structural subtyping (not `ABC`/`isinstance` inheritance): any class that implements these three members satisfies the protocol. This means:
+- Unit tests can pass a `MagicMock()` directly — no special mock class needed.
+- AWS Bedrock embedding (M12) will be a drop-in without modifying any calling code.
+- The API route receives `EmbeddingProvider` from `Depends(get_embedding_provider)` — the specific implementation is hidden.
+
+#### Efficient filter mode (lucene engine)
+
+OpenSearch supports two approaches to filtering k-NN results:
+
+1. **Post-filtering** — run the full ANN search, then discard documents that fail the filter. Can return fewer than k results if many candidates are filtered out.
+2. **Efficient filtering** (lucene engine, OpenSearch 2.9+) — the filter is applied **during HNSW graph traversal**, pruning branches that can never produce matching documents. Returns exactly k results (or all matching if fewer than k exist).
+
+The `nmslib` engine does not support efficient filtering; `lucene` does. The index mapping was changed from `"engine": "nmslib"` to `"engine": "lucene"` to enable the filter-inside-knn query syntax:
+
+```json
+{
+    "query": {
+        "knn": {
+            "embedding_vector": {
+                "vector": [...],
+                "k": 10,
+                "filter": {"bool": {"filter": [{"term": {"country": "Spain"}}]}}
+            }
+        }
+    }
+}
+```
+
+#### API integration — embedding provider as shared state
+
+The SentenceTransformer model (~80 MB) takes 1–2 s to load. Loading it per-request would be catastrophic for latency. The model is loaded **once at startup** in the FastAPI lifespan and stored on `app.state.embedding_provider`. Route handlers receive it via `Depends(get_embedding_provider)`.
+
+The factory pattern (`_create_embedding_provider(settings)`) separates model construction from the lifespan context so unit tests can patch just the factory without mocking the entire lifespan:
+
+```python
+@patch("travel_ai_search.api.app._create_embedding_provider", return_value=MagicMock())
+def test_vector_endpoint(mock_create): ...
+```
+
+### Design decisions
+
+| Decision | Chosen | Alternative | Reason |
+|---|---|---|---|
+| Embedding model | `all-MiniLM-L6-v2` | `bge-small-en-v1.5`, `text-embedding-3-small` | Industry benchmark quality; 384d (small HNSW index); runs on CPU; no API key required |
+| Vector dimension | 384 | 768, 1536 | Small enough for single-node HNSW; MiniLM produces 384d by default; tradeoff: quality vs memory |
+| Space type | `cosinesimil` | `l2`, `innerproduct` | Cosine is scale-invariant; equals dot product when L2-normalised; standard for sentence encoders |
+| HNSW engine | `lucene` | `nmslib`, `faiss` | Only lucene supports efficient filter mode on OpenSearch 2.15; nmslib does not support filters |
+| Embedding pipeline | Offline batch script | Real-time at ingest | Decouples slow CPU embedding from fast BM25 indexing; can be re-run with a new model |
+| Batch size | 64 | 32, 128 | Fits comfortably in CPU RAM; maximises throughput without memory pressure |
+| Provider abstraction | Protocol (structural) | ABC (nominal) | No inheritance required; MagicMock satisfies it directly; Bedrock provider is a drop-in |
+| Model load location | `app.state` at lifespan | Module-level singleton, per-request | Avoids global state; respects FastAPI's dependency injection; testable via factory patch |
+| Test isolation | `autouse` fixture patches factory | Patch per test | All unit tests are automatically insulated from model load; integration tests use real model |
+
+### Results summary (M5)
+
+| Metric | BM25 | Vector | Δ |
+|---|---|---|---|
+| NDCG@10 | 0.5007 | **0.6940** | +38.6% |
+| MRR | 0.6842 | **0.8688** | +27.0% |
+| HitRate@10 | 0.8226 | **1.0000** | +21.6% |
+| exact_destination NDCG@10 | 0.1830 | **0.8392** | +358.8% |
+| Latency p50 | 24 ms | 11 ms | faster |
+| Latency p95 | 45 ms | 135 ms | more variable |
+
+The most important result: the destination gap that cost BM25 NDCG=0.0 on 5 queries is fully resolved by vector retrieval. Hybrid retrieval (M6–7) will seek to combine the precision of BM25 for exact-match queries with the recall of vector search.
