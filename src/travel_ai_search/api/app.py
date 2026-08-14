@@ -1,9 +1,10 @@
 """FastAPI application entry point.
 
 Resources created once at startup and stored on app.state:
-  os_client          — shared OpenSearch connection pool
-  embedding_provider — sentence-transformers model (loaded once; ~1-2 s on first run)
-  reranker           — cross-encoder model (None when reranking_enabled=False)
+  os_client                  — shared OpenSearch connection pool
+  embedding_provider         — sentence-transformers model (loaded once; ~1-2 s on first run)
+  reranker                   — cross-encoder model (None when reranking_enabled=False)
+  query_understanding_engine — rule-based QU engine (always created; pure Python, no I/O)
 
 All route handlers receive these via dependency functions in deps.py.
 """
@@ -16,11 +17,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from travel_ai_search.api.routes import query as query_router
 from travel_ai_search.api.routes import search as search_router
 from travel_ai_search.config.settings import Settings, get_settings
 from travel_ai_search.embeddings.base import EmbeddingProvider
 from travel_ai_search.embeddings.local import LocalEmbeddingProvider
 from travel_ai_search.infrastructure.opensearch import create_client
+from travel_ai_search.query_understanding.base import QueryUnderstandingEngine
+from travel_ai_search.query_understanding.extractor import RuleBasedQueryUnderstandingEngine
 from travel_ai_search.reranking.base import Reranker
 
 logger = logging.getLogger(__name__)
@@ -29,6 +33,11 @@ logger = logging.getLogger(__name__)
 def _create_embedding_provider(settings: Settings) -> EmbeddingProvider:
     """Factory — separated from lifespan so tests can patch it cheaply."""
     return LocalEmbeddingProvider(settings.embedding_model_name)
+
+
+def _create_query_understanding_engine(settings: Settings) -> QueryUnderstandingEngine:
+    """Factory — separated from lifespan so tests can patch it cheaply."""
+    return RuleBasedQueryUnderstandingEngine()
 
 
 def _create_reranker(settings: Settings) -> Reranker | None:
@@ -58,6 +67,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.os_client = create_client(settings)
     app.state.embedding_provider = _create_embedding_provider(settings)
     app.state.reranker = _create_reranker(settings)
+    app.state.query_understanding_engine = _create_query_understanding_engine(settings)
     yield
     app.state.os_client.close()
 
@@ -70,6 +80,7 @@ app = FastAPI(
 )
 
 app.include_router(search_router.router, prefix="/search")
+app.include_router(query_router.router, prefix="/query")
 
 
 @app.get("/health", tags=["Health"])

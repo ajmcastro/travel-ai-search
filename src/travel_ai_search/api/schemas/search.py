@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict
 
+from travel_ai_search.api.schemas.query import QueryUnderstandResponse
+from travel_ai_search.retrieval.fusion import FusionMethod
 from travel_ai_search.retrieval.hybrid import HybridSearchResult
 from travel_ai_search.retrieval.lexical import LexicalSearchResult
 from travel_ai_search.retrieval.vector import VectorSearchResult
@@ -120,4 +122,53 @@ class HybridSearchResponse(BaseModel):
             lexical_took_ms=result.lexical_took_ms,
             vector_took_ms=result.vector_took_ms,
             reranking_took_ms=result.reranking_took_ms,
+        )
+
+
+class FullSearchRequest(BaseModel):
+    """Request body for the full orchestrated search pipeline (POST /search).
+
+    The query is parsed by the query understanding engine to extract hard
+    constraints (month, airport, price, stars, family/adults flags, country)
+    and a clean semantic query.  No explicit filter parameters are accepted
+    here — constraints must come from natural language in query.
+    """
+
+    query: str
+    top_k: int = 10
+    candidate_k: int | None = None
+    fusion: FusionMethod = FusionMethod.rrf
+    rerank: bool = False
+    rerank_k: int | None = None
+
+
+class FullSearchResponse(BaseModel):
+    """Response for POST /search — extends HybridSearchResponse with QU metadata."""
+
+    hits: list[SearchHit]
+    total: int
+    took_ms: int
+    lexical_took_ms: int
+    vector_took_ms: int
+    reranking_took_ms: int = 0
+    query_understanding: QueryUnderstandResponse
+
+    @classmethod
+    def from_result(
+        cls,
+        result: HybridSearchResult,
+        qu_response: QueryUnderstandResponse,
+    ) -> FullSearchResponse:
+        hits = [
+            SearchHit.model_validate({"id": hit.id, "score": hit.score, **hit.source})
+            for hit in result.hits
+        ]
+        return cls(
+            hits=hits,
+            total=result.total,
+            took_ms=result.took_ms,
+            lexical_took_ms=result.lexical_took_ms,
+            vector_took_ms=result.vector_took_ms,
+            reranking_took_ms=result.reranking_took_ms,
+            query_understanding=qu_response,
         )

@@ -394,3 +394,66 @@ Results are also saved as machine-readable JSON under `data/evaluation/results/`
 - Does expanding the reranking text to include star-rating, price tier, and board type improve `multi_constraint` and `family` without hurting semantic classes?
 - Can `rerank_k=20` (instead of 50) preserve most of the NDCG gain with half the latency overhead? (Latency-quality tradeoff sweep)
 - Would a domain-specific fine-tuned cross-encoder outperform the general MS-MARCO model on travel queries?
+
+---
+
+### [Milestone 9] Query understanding: rule-based constraint extraction
+
+**Date:** 2026-08-14
+**Hypothesis:** Parsing hard constraints (month, departure airport, max price, star rating, family/adults flags, country) from free-text queries and running hybrid RRF with extracted filters will outperform baseline hybrid RRF that ignores the natural-language constraint signals.  The benefit should be largest on `multi_constraint` and `natural_language` query classes, and smallest (or zero) on purely semantic classes like `activities`.
+
+**Configuration:**
+- index: `travel_hotels` (5,470 hotels)
+- embedding model: `all-MiniLM-L6-v2` (384-dim)
+- QU engine: `RuleBasedQueryUnderstandingEngine` (regex + keyword lookup; no LLM)
+- hybrid: RRF fusion, k=60, candidate_k=50
+- key design: ground-truth filters IGNORED; constraints extracted from query_text only
+
+**Results:**
+
+| Metric | BM25 | Vector | Hybrid | RRF | Rerank | **Understand** |
+|---|---|---|---|---|---|---|
+| NDCG@10 | 0.5007 | 0.6940 | 0.6003 | 0.6239 | **0.6830** | 0.6312 |
+| MRR | 0.6842 | 0.8688 | 0.8542 | 0.8449 | 0.8191 | **0.8620** |
+| HitRate@10 | 0.8226 | 1.0000 | 0.9355 | **0.9516** | **0.9516** | 0.9355 |
+| Precision@10 | 0.6145 | 0.7790 | 0.6823 | 0.7210 | **0.7935** | 0.7290 |
+| Latency p50 | 24 ms | 11 ms | 57 ms | 56 ms | 113 ms | **45 ms** |
+| Latency p95 | 45 ms | 135 ms | 90 ms | 84 ms | 142 ms | **71 ms** |
+
+**Query-class breakdown (Understand vs RRF):**
+
+| Class | n | RRF NDCG | Understand NDCG | Δ | Winner |
+|---|---|---|---|---|---|
+| adults_couples | 6 | 0.8928 | **0.9721** | +0.0793 (+8.9%) | ✓ Understand |
+| multi_constraint | 6 | 0.7473 | **0.7627** | +0.0154 (+2.1%) | ✓ Understand |
+| quiet_peaceful | 5 | **0.6922** | **0.6922** | 0.0000 | Tie |
+| luxury | 6 | **0.6951** | **0.6951** | 0.0000 | Tie |
+| natural_language | 4 | 0.5520 | **0.5778** | +0.0258 (+4.7%) | ✓ Understand |
+| exact_destination | 10 | 0.5347 | **0.5962** | +0.0615 (+11.5%) | ✓ Understand |
+| family | 9 | **0.7352** | 0.6900 | −0.0452 (−6.1%) | RRF |
+| nightlife | 5 | **0.5053** | 0.4981 | −0.0072 (−1.4%) | RRF |
+| activities | 6 | **0.4002** | 0.4002 | 0.0000 | Tie |
+| budget | 5 | **0.4221** | 0.3445 | −0.0776 (−18.4%) | RRF |
+
+**Surprises / observations:**
+
+1. **adults_couples class: largest gain (+8.9%).** The QU engine correctly extracts `adults_only=True` from phrases like "adults only", "no kids", "couples only". This hard filter eliminates all family-friendly hotels from the candidate pool, dramatically improving precision and NDCG for this class. RRF must rely purely on semantic overlap ("adults", "spa", "romantic") without the boolean guarantee. This is the clearest win for structured constraint extraction: a deterministic rule delivers a result that a semantic model cannot guarantee.
+
+2. **exact_destination +11.5% (0.53 → 0.60).** For queries like "hotels in Tenerife" or "holiday in Santorini", the QU engine maps the island/region name to a country filter (Tenerife → Spain, Santorini → Greece). This narrows the search to the correct country, allowing vector search to focus on the right regional hotels. BM25's "in Tenerife" keyword match was already good; the country filter adds a hard guarantee.
+
+3. **luxury and quiet_peaceful: identical to RRF (tie).** These query classes contain no extractable hard constraints — "luxury boutique spa retreat" has no month, price, airport, or country. The semantic_query equals the original query, and the hybrid search runs identically to RRF. QU adds zero noise but zero signal: pure semantic searches are unaffected by the QU layer.
+
+4. **budget class: severe regression (−18.4%).** The golden budget queries include "value for money 4 star highly rated" which causes QU to extract `min_star_rating=4`. If the golden relevant hotels include 3-star budget hotels (likely, since budget queries value affordability over luxury), the hard `min_star_rating=4` filter excludes them entirely — NDCG=0 for that specific query. This reveals a key limitation of rule-based extraction: the star rating extractor cannot distinguish "4 star value" (quality preference) from "find me 4-star hotels" (hard constraint).
+
+5. **family regression (−6.1%).** QU extracts `family_friendly=True` from "family" queries. Some relevant hotels in the golden set may be tagged `family_friendly=False` in the structured field despite offering kids activities (e.g., all-inclusive resorts that welcome children without the explicit boolean flag). The hard filter then incorrectly excludes them. Rule-based NL extraction cannot know the semantic gap between "family" (user intent) and `family_friendly` (structured field).
+
+6. **multi_constraint and natural_language: confirms QU hypothesis (+2.1%, +4.7%).** For "family beach hotel Greece July Manchester" and "Find me a family holiday somewhere warm in October departing from Manchester under 2000 pounds", the QU engine recovers nearly the same constraints as the hand-annotated golden filters. This confirms that the rule-based extractor correctly parses the constraint language in these query classes.
+
+7. **Latency FASTER than baseline RRF (45 ms vs 56 ms p50).** The QU engine is sub-millisecond (pure Python regex). The speed gain comes from semantic_query distillation: after extracting constraints, the residual semantic query is shorter (e.g., "beach hotel" vs "family beach hotel Greece July Manchester"). A shorter BM25 query has fewer terms to analyse and score, reducing BM25 latency. Hard constraint filters also reduce the BM25 and vector candidate pools faster, lowering heap operation cost.
+
+**Key finding:** Rule-based QU beats raw RRF on overall NDCG (+1.2%) and MRR (+2.0%) while being FASTER (45 ms vs 56 ms). It wins decisively on `adults_couples` (+8.9%), `exact_destination` (+11.5%), and structured-constraint classes. The main failure mode is **false-positive constraint extraction**: extracting star ratings or family flags from ambiguous phrases and then filtering out relevant results. An LLM-based engine (M10, M12) could avoid this by understanding query intent more fully.
+
+**Next question this raises:**
+- Can a confidence threshold on extracted constraints reduce false positives (e.g., only apply min_star_rating if the phrasing is unambiguous)?
+- M10 (LLM rewriting): would an LLM engine improve the `budget` and `family` class by understanding that "4-star value" is a preference, not a hard filter?
+- Combining QU + reranking: does the better-filtered candidate pool (from QU) improve the reranker's output quality beyond just the RRF+rerank baseline?

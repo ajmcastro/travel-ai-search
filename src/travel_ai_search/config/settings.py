@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     reranker_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     rerank_k: int = 50
 
+    # Query understanding (Milestone 9)
+    # query_understanding_enabled: controls whether the QU engine is created at startup.
+    #   The rule-based engine is pure Python and costs nothing to load; this flag
+    #   exists to allow disabling it (e.g. for A/B testing) without code changes.
+    query_understanding_enabled: bool = True
+
 
 @lru_cache
 def get_settings() -> Settings:

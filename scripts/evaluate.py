@@ -166,12 +166,51 @@ def make_rerank_fn(
     return search
 
 
+def make_understand_fn(
+    client: Any,
+    index: str,
+    embedding_provider: Any = None,
+    rrf_k: int = 60,
+    candidate_k: int = 50,
+    **_: Any,
+) -> Any:
+    """Return a SearchFn that uses query understanding to extract filters from text.
+
+    Unlike other strategies, this function IGNORES the ground-truth filters passed
+    by the evaluator.  Instead it extracts constraints purely from query_text using
+    the rule-based QU engine, then runs hybrid RRF with those extracted constraints.
+
+    This tests whether the QU engine can correctly recover the same filters that
+    were manually specified in the golden dataset — a measure of NL understanding.
+    """
+    from travel_ai_search.query_understanding.extractor import RuleBasedQueryUnderstandingEngine
+
+    provider = embedding_provider
+    engine = RuleBasedQueryUnderstandingEngine()
+
+    def search(query_text: str, top_k: int, filters: dict[str, Any]) -> list[str]:
+        qu = engine.understand(query_text)
+        params = HybridSearchParams(
+            query=qu.semantic_query,
+            top_k=top_k,
+            candidate_k=candidate_k,
+            fusion=FusionMethod.rrf,
+            rrf_k=rrf_k,
+            **qu.to_search_filters(),
+        )
+        result = hybrid_search(client, provider, params, index=index)
+        return [hit.id for hit in result.hits]
+
+    return search
+
+
 STRATEGIES: dict[str, Any] = {
     "bm25": make_bm25_fn,
     "vector": make_vector_fn,
     "hybrid": make_hybrid_fn,
     "rrf": make_rrf_fn,
     "rerank": make_rerank_fn,
+    "understand": make_understand_fn,
 }
 
 
@@ -293,7 +332,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # Load embedding model if needed
     embedding_provider = None
-    if args.strategy in ("vector", "hybrid", "rrf", "rerank"):
+    if args.strategy in ("vector", "hybrid", "rrf", "rerank", "understand"):
         print(f"\nLoading embedding model '{settings.embedding_model_name}' …")
         embedding_provider = LocalEmbeddingProvider(settings.embedding_model_name)
         print(f"  dimension={embedding_provider.dimension}")

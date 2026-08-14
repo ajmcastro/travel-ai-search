@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 8 — Cross-encoder reranking
+## Current status: Milestone 9 — Query understanding and structured constraints
 
 | # | Milestone | Status |
 |---|---|---|
@@ -18,8 +18,8 @@ An educational, production-quality project demonstrating modern AI search archit
 | 5 | Embeddings and vector retrieval | ✅ Complete |
 | 6 | Hybrid retrieval | ✅ Complete |
 | 7 | RRF and alternative fusion | ✅ Complete |
-| 8 | Cross-encoder reranking | ✅ **Complete** |
-| 9 | Query understanding and structured constraints | Pending |
+| 8 | Cross-encoder reranking | ✅ Complete |
+| 9 | Query understanding and structured constraints | ✅ **Complete** |
 | 10 | Query rewriting | Pending |
 | 11 | Multi-query retrieval | Pending |
 | 12 | AWS Bedrock providers | Pending |
@@ -27,22 +27,23 @@ An educational, production-quality project demonstrating modern AI search archit
 | 14 | Graph-enhanced retrieval prototype | Pending |
 | 15 | Production API, observability, resilience | Pending |
 
-### BM25 vs Vector vs Hybrid vs RRF vs Rerank (K=10, 62 queries, 10 query classes)
+### BM25 vs Vector vs Hybrid vs RRF vs Rerank vs Understand (K=10, 62 queries, 10 query classes)
 
-| Metric | BM25 | Vector | Hybrid (50/50) | Hybrid (RRF k=60) | Rerank (RRF + CE) |
-|---|---|---|---|---|---|
-| NDCG@10 | 0.5007 | 0.6940 | 0.6003 | 0.6239 | **0.6830** |
-| MRR | 0.6842 | **0.8688** | 0.8542 | 0.8449 | 0.8191 |
-| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | **0.9516** | **0.9516** |
-| Precision@10 | 0.6145 | 0.7790 | 0.6823 | 0.7210 | **0.7935** |
-| Latency p50 | **24 ms** | 11 ms | 57 ms | 56 ms | 113 ms |
-| Latency p95 | **45 ms** | 135 ms | 90 ms | 84 ms | 142 ms |
+| Metric | BM25 | Vector | Hybrid (50/50) | RRF | Rerank | Understand |
+|---|---|---|---|---|---|---|
+| NDCG@10 | 0.5007 | 0.6940 | 0.6003 | 0.6239 | **0.6830** | 0.6312 |
+| MRR | 0.6842 | 0.8688 | 0.8542 | 0.8449 | 0.8191 | **0.8620** |
+| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | **0.9516** | **0.9516** | 0.9355 |
+| Precision@10 | 0.6145 | 0.7790 | 0.6823 | 0.7210 | **0.7935** | 0.7290 |
+| Latency p50 | 24 ms | 11 ms | 57 ms | 56 ms | 113 ms | **45 ms** |
+| Latency p95 | 45 ms | 135 ms | 90 ms | 84 ms | 142 ms | **71 ms** |
 
 **Key findings (cumulative):**
 - Vector (M5): NDCG +38.6% vs BM25; `exact_destination` NDCG jumped from 0.18 → 0.84 (+358%); HitRate = 1.000.
 - Hybrid (M6) — weighted sum, 50/50: overall NDCG is between BM25 and vector (0.60). Naive 50/50 fusion can *regress* from the best individual retriever when one retriever produces meaningless scores for a query class. `exact_destination` NDCG drops from 0.84 (vector) to 0.48.
 - Hybrid (M7) — RRF (k=60): beats weighted-sum (+3.9% NDCG, +5.7% Precision) by using rank positions instead of raw scores. `exact_destination` recovers from 0.48 to 0.53; `activities` beats vector (0.40 vs 0.38). Still below pure vector overall.
-- Rerank (M8) — RRF + cross-encoder (`ms-marco-MiniLM-L-6-v2`, 50 candidates): **highest NDCG overall (0.683)**, surpassing pure vector (0.694 → 0.683 is close but the cross-encoder wins on most sub-classes). `exact_destination` jumps from 0.53 to 0.79 (+48%); `activities` from 0.40 to 0.57 (+43%). Cost: ~57 ms extra latency (113 ms vs 56 ms p50). Small MRR regression on structured-constraint classes where the general-purpose relevance model has no advantage over the already-filtered pool.
+- Rerank (M8) — RRF + cross-encoder (`ms-marco-MiniLM-L-6-v2`, 50 candidates): **highest NDCG overall (0.683)**. `exact_destination` jumps from 0.53 to 0.79 (+48%); `activities` from 0.40 to 0.57 (+43%). Cost: ~57 ms extra latency.
+- Understand (M9) — rule-based QU + RRF: beats RRF on NDCG (+1.2%) and MRR (+2.0%) while being **20% faster** (45 ms vs 56 ms p50). `adults_couples` NDCG +8.9% (correct `adults_only` filter extracted). Main failure: false-positive constraints on `budget` queries (−18.4%).
 
 Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
@@ -149,6 +150,10 @@ uv run python scripts/evaluate.py --strategy rrf
 # Run reranking evaluation: RRF + cross-encoder (Milestone 8)
 # Downloads cross-encoder/ms-marco-MiniLM-L-6-v2 (~86 MB) on first run
 uv run python scripts/evaluate.py --strategy rerank
+
+# Run query understanding evaluation: rule-based QU + RRF (Milestone 9)
+# Ignores ground-truth filters; extracts constraints from query text only
+uv run python scripts/evaluate.py --strategy understand
 ```
 
 ---
@@ -168,6 +173,8 @@ Available endpoints:
 | `GET /search/lexical?q=...` | BM25 lexical search |
 | `GET /search/vector?q=...` | Dense vector (ANN) search |
 | `GET /search/hybrid?q=...` | Hybrid BM25 + vector (weighted-sum or RRF fusion) |
+| `POST /search` | Full pipeline: QU → hybrid RRF → optional reranking |
+| `POST /query/understand` | Inspect query understanding extraction result |
 
 Example searches:
 
@@ -193,6 +200,16 @@ curl "localhost:8000/search/hybrid?q=adults+luxury+spa&fusion=rrf&rerank=true"
 
 # Reranking with custom candidate pool size (default: 50)
 curl "localhost:8000/search/hybrid?q=hotels+in+Tenerife&fusion=rrf&rerank=true&rerank_k=30"
+
+# Full orchestrated pipeline: QU → hybrid RRF → response with query_understanding (Milestone 9)
+curl -X POST "localhost:8000/search" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "family beach holiday in Greece July from Manchester under £2000"}'
+
+# Inspect what the QU engine extracts from a query
+curl -X POST "localhost:8000/query/understand" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "adults only luxury spa resort in Santorini"}'
 ```
 
 Response shape:
@@ -282,6 +299,7 @@ Copy `.env.example` to `.env` (or run `make env`) and adjust as needed. All sett
 | `RERANKING_ENABLED` | `false` | Load cross-encoder at startup (set `true` to enable `rerank=true` on API) |
 | `RERANKER_MODEL_NAME` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder model (~86 MB download) |
 | `RERANK_K` | `50` | Default candidates to pass to the cross-encoder |
+| `QUERY_UNDERSTANDING_ENABLED` | `true` | Enable rule-based QU engine at startup (pure Python; no download needed) |
 
 ---
 
@@ -293,7 +311,8 @@ src/travel_ai_search/
 │   ├── app.py               # FastAPI app, lifespan (OpenSearch + embedding provider)
 │   ├── deps.py              # FastAPI dependency injection
 │   └── routes/
-│       └── search.py        # GET /search/lexical, GET /search/vector
+│       ├── search.py        # GET /search/lexical, GET /search/vector, POST /search
+│       └── query.py         # POST /query/understand
 ├── config/
 │   └── settings.py          # Pydantic settings, loaded from env vars / .env
 ├── domain/
@@ -308,6 +327,10 @@ src/travel_ai_search/
 ├── ingestion/
 │   ├── index.py             # OpenSearch index mapping and CRUD (knn_vector)
 │   └── ingestor.py          # Bulk ingestion: load_products(), ingest()
+├── query_understanding/
+│   ├── base.py              # QueryUnderstandingEngine Protocol (runtime_checkable)
+│   ├── models.py            # QueryUnderstanding dataclass + to_search_filters()
+│   └── extractor.py         # RuleBasedQueryUnderstandingEngine (regex + keyword lookup)
 ├── reranking/
 │   ├── base.py              # Reranker Protocol (runtime_checkable, structural typing)
 │   └── local.py             # LocalCrossEncoderReranker (sentence-transformers CrossEncoder)
@@ -337,8 +360,8 @@ data/
     └── results/             # JSON evaluation results per run
 
 tests/
-├── unit/                    # No infrastructure required (263 tests)
-└── integration/             # Requires OpenSearch running (109 tests)
+├── unit/                    # No infrastructure required (312 tests)
+└── integration/             # Requires OpenSearch running (117 tests)
 ```
 
 ---

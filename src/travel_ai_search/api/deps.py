@@ -13,6 +13,7 @@ from opensearchpy import OpenSearch
 from travel_ai_search.config.settings import Settings
 from travel_ai_search.config.settings import get_settings as _get_settings
 from travel_ai_search.embeddings.base import EmbeddingProvider
+from travel_ai_search.query_understanding.base import QueryUnderstandingEngine
 from travel_ai_search.reranking.base import Reranker
 
 
@@ -36,6 +37,12 @@ def get_reranker(request: Request) -> Reranker | None:
     optional reranker must pass None-safely to downstream functions.
     """
     return getattr(request.app.state, "reranker", None)
+
+
+def get_query_understanding_engine(request: Request) -> QueryUnderstandingEngine:
+    """Return the shared query understanding engine stored on app state at startup."""
+    engine: QueryUnderstandingEngine = request.app.state.query_understanding_engine
+    return engine
 
 
 def get_settings() -> Settings:

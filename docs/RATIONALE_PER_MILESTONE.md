@@ -1059,3 +1059,87 @@ If the model fails to load at startup: `_create_reranker()` catches the exceptio
 | Latency p50 | **56 ms** | 113 ms | +57 ms |
 
 **Core learning:** Cross-encoder reranking is the highest-NDCG strategy overall, surpassing pure vector (0.694) for the first time. The +9.5% NDCG improvement over RRF comes from the cross-encoder's ability to attend jointly to query tokens and document tokens — it can see that "Tenerife" in the query matches "destination: Tenerife" in the document, which neither BM25 nor vector can do independently. The cost is ~2× latency (113 ms vs 56 ms p50) and a small MRR regression on structured-constraint classes where the model's general-purpose relevance judgment has no advantage over the already-filtered pool. This two-stage architecture (fast retrieval → powerful reranking) is the standard production pattern for neural IR systems.
+
+---
+
+## Milestone 9 — Query understanding and structured constraints
+
+### What was added
+
+- **`query_understanding/` module**: domain model (`QueryUnderstanding`), `QueryUnderstandingEngine` Protocol, and `RuleBasedQueryUnderstandingEngine`.
+- **`POST /search`**: full orchestrated pipeline endpoint — QU → hybrid RRF → optional reranking.
+- **`POST /query/understand`**: standalone endpoint to inspect what the QU engine extracts from a query.
+- **`understand` evaluation strategy**: treats query_text as the only input; ignores ground-truth filters; uses QU to recover constraints.
+- Settings: `query_understanding_enabled: bool = True`.
+
+### IR concepts introduced
+
+#### Hard constraints vs soft preferences
+
+Every travel query has two kinds of requirements:
+- **Hard constraints** must be satisfied. A hotel that departs from the wrong airport or is outside the price budget is not acceptable regardless of how good the description sounds. These become OpenSearch `filter` clauses.
+- **Soft preferences** should influence ranking but are not dealbreakers. "Beach", "spa", "pool" remain in the semantic query so that BM25 and vector search can score them naturally.
+
+The distinction is crucial: treating a soft preference as a hard filter (e.g., filtering only to hotels with "beach" as a keyword) would incorrectly exclude hotels that describe themselves as "beachfront" or "seafront". The right place to enforce soft preferences is in the ranking step, not the filter step.
+
+#### Semantic query distillation
+
+After extracting hard constraints, the residual text (semantic_query) is used for BM25/vector retrieval. For "family beach hotel Greece July Manchester":
+- Extracted: `family_friendly=True`, `country=Greece`, `month=July`, `departure_airport=MAN`
+- Semantic query: "beach hotel"
+
+Without distillation, BM25 would try to score "family beach hotel Greece July Manchester" against every hotel description. The terms "Greece", "July", and "Manchester" would produce BM25 term-frequency signal in documents that mention those words, conflating the constraint signal with the semantic signal. With distillation, only the semantically meaningful residue reaches BM25 and vector search.
+
+#### Named Entity Recognition (NER) for structured search
+
+NER is the task of identifying and classifying named entities (persons, locations, organizations, dates, quantities) in text. This extractor performs domain-specific NER:
+- **Geographic entities**: "Manchester" → `departure_airport=MAN`; "Spain" → `country=Spain`; "Tenerife" (island) → `country=Spain` via region-to-country mapping
+- **Temporal entities**: "October" → `month=October`
+- **Numeric entities**: "under £2000" → `max_price=2000`; "5 star" → `min_star_rating=5`
+
+The key design challenge for geography: the dataset stores destinations at city level ("Playa de las Américas"), but users refer to the island ("Tenerife"). Mapping region→country (not region→destination) avoids false filter precision: "hotels in Tenerife" correctly restricts to Spain without requiring an exact destination match.
+
+#### Rule-based vs LLM-based extraction
+
+| Approach | Speed | Cost | Generalisation | Brittleness |
+|---|---|---|---|---|
+| Rule-based (M9) | Sub-ms | Free | Poor for novel phrasings | High (regex edge cases) |
+| LLM rewriting (M10) | 200–500 ms | Per-call cost | Excellent | Low (understands intent) |
+| Bedrock LLM (M12) | 200–500 ms | AWS cost | Excellent | Low |
+
+Rule-based extraction is the right starting point: it is free, deterministic, and fast. It works well for structured queries ("family beach hotel Greece July Manchester") and fails on ambiguous phrasing ("4-star value for money" → should NOT extract min_star_rating=4). LLM-based engines address this by understanding intent, not just pattern matching.
+
+#### Separation of understanding from retrieval
+
+`QueryUnderstandingEngine` is a pure function (query → `QueryUnderstanding`) with no knowledge of the retrieval layer. This separation enables:
+- Testing the understanding engine in isolation (pure Python unit tests, no OpenSearch needed)
+- Swapping the engine (rule-based → LLM → Bedrock) without changing routes or retrieval code
+- Exposing the understanding for observability (the `POST /search` response includes the full `QueryUnderstanding` object, so callers can see exactly what was extracted)
+- Evaluating understanding quality independently (by comparing extracted constraints to golden annotations)
+
+### Key design decisions
+
+| Decision | Chosen | Alternatives | Reason |
+|---|---|---|---|
+| Region → country (not destination) | Map island/region to country only | Map to destination city | Dataset destinations are city-level; users don't use city names for islands |
+| No destination extraction | Destination always None | Maintain a city→destination lookup | City names overlap with many common words; false-positive risk high |
+| Soft preferences NOT removed from semantic | Kept in semantic_query | Remove all detected features | BM25/vector naturally boost hotels matching "spa", "pool", etc. |
+| Semantic query fallback | `semantic or original_query` | Raise error on empty | Graceful: if all tokens consumed, original query is better than empty string |
+| `query_understanding_enabled: bool` | True by default | Opt-in | Rule-based engine is free; no reason to disable by default |
+| POST /search uses only QU for filters | No manual override in request body | Allow filter override | Forces the NL interface; GET /search/hybrid provides explicit filters |
+
+### Results summary (M9)
+
+| Metric | RRF | Understand | Δ vs RRF |
+|---|---|---|---|
+| NDCG@10 | 0.6239 | **0.6312** | +0.0073 (+1.2%) |
+| MRR | 0.8449 | **0.8620** | +0.0171 (+2.0%) |
+| HitRate@10 | **0.9516** | 0.9355 | −0.0161 (−1.7%) |
+| Precision@10 | 0.7210 | **0.7290** | +0.0080 (+1.1%) |
+| adults_couples NDCG@10 | 0.8928 | **0.9721** | +0.0793 (+8.9%) |
+| multi_constraint NDCG@10 | 0.7473 | **0.7627** | +0.0154 (+2.1%) |
+| budget NDCG@10 | **0.4221** | 0.3445 | −0.0776 (−18.4%) |
+| family NDCG@10 | **0.7352** | 0.6900 | −0.0452 (−6.1%) |
+| Latency p50 | 56 ms | **45 ms** | −11 ms (−20%) |
+
+**Core learning:** Rule-based QU improves NDCG and MRR over raw RRF while also being 20% faster (semantic distillation shortens the BM25 query). The main failure mode is false-positive constraint extraction — applying a hard filter when the user expressed a preference. The `adults_couples` class shows the best-case scenario: a clear boolean intent ("adults only") maps cleanly to a structured filter. The `budget` class shows the worst case: ambiguous phrasing ("4-star value") causes an incorrect hard filter. The protocol abstraction (`QueryUnderstandingEngine`) ensures M10's LLM-based engine can be substituted without changing any routes or retrieval code.
