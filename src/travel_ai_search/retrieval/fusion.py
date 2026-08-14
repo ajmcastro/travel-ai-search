@@ -9,23 +9,43 @@ This module is the single authoritative source for:
   fuse_results() — min-max normalised weighted sum fusion of two ranked lists.
     Combines BM25 and vector scores onto a common [0, 1] scale before merging.
 
+  rrf_fuse() — Reciprocal Rank Fusion of one or more ranked lists (M7).
+    Score = Σ_r 1/(k + rank_r(d)).  Rank-position-based; robust to
+    incomparable score scales between retrievers.
+
 Design notes
 ------------
-Score normalisation is necessary because BM25 and cosine similarity live in
-different numeric ranges.  BM25 scores are unbounded (corpus- and query-
-dependent); cosine similarity scores are in [0, 1] (normalised vectors).
-Adding them directly lets BM25 dominate.  Min-max normalisation maps each
-list independently to [0, 1] before combining.
+Score normalisation problem (weighted sum)
+  BM25 scores are unbounded (corpus- and query-dependent); cosine similarity
+  is in [0, 1].  Adding them directly lets BM25 dominate.  Min-max
+  normalisation maps each list independently to [0, 1] before combining.
 
-Reciprocal Rank Fusion (RRF), an alternative that avoids score normalisation
-altogether, is added in Milestone 7.
+RRF and the score-scale problem
+  RRF avoids normalisation by ignoring score values entirely — only rank
+  positions matter.  A document ranked 1st by BM25 contributes 1/(k+1)
+  regardless of whether its BM25 score is 12.4 or 0.01.  This makes RRF
+  robust to retrievers that produce meaningless score magnitudes for some
+  query classes (e.g. BM25 on destination-name queries).
 """
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any
 
 from travel_ai_search.retrieval.types import Hit
+
+
+class FusionMethod(StrEnum):
+    """Fusion strategy identifiers.
+
+    weighted — min-max normalised weighted sum (M6).
+    rrf      — Reciprocal Rank Fusion (M7).
+    """
+
+    weighted = "weighted"
+    rrf = "rrf"
+
 
 # ── Filter building ───────────────────────────────────────────────────────────
 
@@ -137,5 +157,52 @@ def fuse_results(
         combined = lexical_weight * lex_score + vector_weight * vec_score
         merged.append(Hit(id=doc_id, score=combined, source=source))
 
+    merged.sort(key=lambda h: h.score, reverse=True)
+    return merged[:top_k]
+
+
+# ── Reciprocal Rank Fusion ────────────────────────────────────────────────────
+
+_RRF_K_DEFAULT = 60  # Standard constant from Cormack, Clarke & Buettcher (2009)
+
+
+def rrf_fuse(
+    ranked_lists: list[list[Hit]],
+    *,
+    k: int = _RRF_K_DEFAULT,
+    top_k: int,
+) -> list[Hit]:
+    """Reciprocal Rank Fusion of one or more ranked lists.
+
+    Algorithm (Cormack et al., 2009)
+    ---------------------------------
+    For each document d across all ranked lists r:
+
+        RRF_score(d) = Σ_r  1 / (k + rank_r(d))
+
+    where rank_r(d) is the 1-indexed position of d in list r.
+    Documents absent from a list contribute 0.0 for that list.
+
+    k=60 is the empirically robust default from the original paper.
+    It smooths the contribution curve so that even rank-1 documents
+    do not dominate when lists disagree.  Smaller k amplifies top-rank
+    advantage; larger k flattens it (all ranks contribute similarly).
+
+    Unlike fuse_results(), this function accepts a list of ranked lists
+    (not just two), making it naturally extensible to multi-query
+    retrieval (Milestone 11) without any interface change.
+    """
+    accumulated: dict[str, float] = {}
+    sources: dict[str, dict[str, Any]] = {}
+
+    for ranked_list in ranked_lists:
+        for rank, hit in enumerate(ranked_list, start=1):
+            accumulated[hit.id] = accumulated.get(hit.id, 0.0) + 1.0 / (k + rank)
+            if hit.id not in sources:
+                sources[hit.id] = hit.source
+
+    merged = [
+        Hit(id=doc_id, score=score, source=sources[doc_id]) for doc_id, score in accumulated.items()
+    ]
     merged.sort(key=lambda h: h.score, reverse=True)
     return merged[:top_k]

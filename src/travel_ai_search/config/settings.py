@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     hybrid_vector_weight: float = 0.5
     hybrid_candidate_k: int = 50
 
+    # Fusion strategy (Milestone 7)
+    # hybrid_fusion: default fusion method — "weighted" or "rrf"
+    # rrf_k: smoothing constant in RRF formula 1/(k + rank); k=60 is the
+    #   empirically robust default from Cormack et al. (2009)
+    hybrid_fusion: str = "weighted"
+    rrf_k: int = 60
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -257,3 +257,131 @@ def test_hybrid_finds_family_resort_for_family_query(
     result = hybrid_search(opensearch_client, embedding_provider, params, index=vector_test_index)
     ids = {h.id for h in result.hits}
     assert ids & {"test_hotel_001", "test_hotel_004"}
+
+
+# ── RRF fusion ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.integration
+def test_rrf_search_returns_result_object(
+    opensearch_client: OpenSearch,
+    embedding_provider: LocalEmbeddingProvider,
+    vector_test_index: str,
+) -> None:
+    from travel_ai_search.retrieval.fusion import FusionMethod
+
+    params = HybridSearchParams(
+        query="beach hotel", top_k=6, candidate_k=6, fusion=FusionMethod.rrf
+    )
+    result = hybrid_search(opensearch_client, embedding_provider, params, index=vector_test_index)
+    assert isinstance(result, HybridSearchResult)
+
+
+@pytest.mark.integration
+def test_rrf_search_returns_hits(
+    opensearch_client: OpenSearch,
+    embedding_provider: LocalEmbeddingProvider,
+    vector_test_index: str,
+) -> None:
+    from travel_ai_search.retrieval.fusion import FusionMethod
+
+    params = HybridSearchParams(
+        query="relaxing beach holiday", top_k=6, candidate_k=6, fusion=FusionMethod.rrf
+    )
+    result = hybrid_search(opensearch_client, embedding_provider, params, index=vector_test_index)
+    assert len(result.hits) > 0
+
+
+@pytest.mark.integration
+def test_rrf_search_hits_sorted_descending(
+    opensearch_client: OpenSearch,
+    embedding_provider: LocalEmbeddingProvider,
+    vector_test_index: str,
+) -> None:
+    from travel_ai_search.retrieval.fusion import FusionMethod
+
+    params = HybridSearchParams(query="luxury spa", top_k=6, candidate_k=6, fusion=FusionMethod.rrf)
+    result = hybrid_search(opensearch_client, embedding_provider, params, index=vector_test_index)
+    scores = [h.score for h in result.hits]
+    assert scores == sorted(scores, reverse=True)
+
+
+@pytest.mark.integration
+def test_rrf_filter_family_friendly(
+    opensearch_client: OpenSearch,
+    embedding_provider: LocalEmbeddingProvider,
+    vector_test_index: str,
+) -> None:
+    from travel_ai_search.retrieval.fusion import FusionMethod
+
+    params = HybridSearchParams(
+        query="family holiday",
+        top_k=6,
+        candidate_k=6,
+        fusion=FusionMethod.rrf,
+        family_friendly=True,
+    )
+    result = hybrid_search(opensearch_client, embedding_provider, params, index=vector_test_index)
+    assert len(result.hits) == 3
+    for hit in result.hits:
+        assert hit.source.get("family_friendly") is True
+
+
+@pytest.mark.integration
+def test_rrf_filter_adults_only(
+    opensearch_client: OpenSearch,
+    embedding_provider: LocalEmbeddingProvider,
+    vector_test_index: str,
+) -> None:
+    from travel_ai_search.retrieval.fusion import FusionMethod
+
+    params = HybridSearchParams(
+        query="adults retreat",
+        top_k=6,
+        candidate_k=6,
+        fusion=FusionMethod.rrf,
+        adults_only=True,
+    )
+    result = hybrid_search(opensearch_client, embedding_provider, params, index=vector_test_index)
+    assert len(result.hits) == 1
+    assert result.hits[0].id == "test_hotel_002"
+
+
+@pytest.mark.integration
+def test_rrf_filter_by_month(
+    opensearch_client: OpenSearch,
+    embedding_provider: LocalEmbeddingProvider,
+    vector_test_index: str,
+) -> None:
+    from travel_ai_search.retrieval.fusion import FusionMethod
+
+    params = HybridSearchParams(
+        query="summer holiday",
+        top_k=6,
+        candidate_k=6,
+        fusion=FusionMethod.rrf,
+        month="July",
+    )
+    result = hybrid_search(opensearch_client, embedding_provider, params, index=vector_test_index)
+    assert len(result.hits) == 5
+    for hit in result.hits:
+        assert "July" in hit.source.get("available_months", [])
+
+
+@pytest.mark.integration
+def test_rrf_finds_adults_luxury_hotel(
+    opensearch_client: OpenSearch,
+    embedding_provider: LocalEmbeddingProvider,
+    vector_test_index: str,
+) -> None:
+    from travel_ai_search.retrieval.fusion import FusionMethod
+
+    params = HybridSearchParams(
+        query="exclusive romantic adults-only resort with infinity pool and spa",
+        top_k=3,
+        candidate_k=6,
+        fusion=FusionMethod.rrf,
+    )
+    result = hybrid_search(opensearch_client, embedding_provider, params, index=vector_test_index)
+    ids = [h.id for h in result.hits]
+    assert "test_hotel_002" in ids

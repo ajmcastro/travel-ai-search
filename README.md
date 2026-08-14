@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 6 — Hybrid retrieval
+## Current status: Milestone 7 — RRF and alternative fusion
 
 | # | Milestone | Status |
 |---|---|---|
@@ -16,8 +16,8 @@ An educational, production-quality project demonstrating modern AI search archit
 | 3 | BM25 lexical retrieval | ✅ Complete |
 | 4 | Evaluation framework and BM25 baseline | ✅ Complete |
 | 5 | Embeddings and vector retrieval | ✅ Complete |
-| 6 | Hybrid retrieval | ✅ **Complete** |
-| 7 | RRF and alternative fusion | Pending |
+| 6 | Hybrid retrieval | ✅ Complete |
+| 7 | RRF and alternative fusion | ✅ **Complete** |
 | 8 | Cross-encoder reranking | Pending |
 | 9 | Query understanding and structured constraints | Pending |
 | 10 | Query rewriting | Pending |
@@ -27,20 +27,21 @@ An educational, production-quality project demonstrating modern AI search archit
 | 14 | Graph-enhanced retrieval prototype | Pending |
 | 15 | Production API, observability, resilience | Pending |
 
-### BM25 vs Vector vs Hybrid (K=10, 62 queries, 10 query classes)
+### BM25 vs Vector vs Hybrid vs RRF (K=10, 62 queries, 10 query classes)
 
-| Metric | BM25 | Vector | Hybrid (50/50) |
-|---|---|---|---|
-| NDCG@10 | 0.5007 | **0.6940** | 0.6003 |
-| MRR | 0.6842 | **0.8688** | 0.8542 |
-| HitRate@10 | 0.8226 | **1.0000** | 0.9355 |
-| Precision@10 | 0.6145 | **0.7790** | 0.6823 |
-| Latency p50 | **24 ms** | 11 ms | 57 ms |
-| Latency p95 | **45 ms** | 135 ms | 90 ms |
+| Metric | BM25 | Vector | Hybrid (50/50) | Hybrid (RRF k=60) |
+|---|---|---|---|---|
+| NDCG@10 | 0.5007 | **0.6940** | 0.6003 | 0.6239 |
+| MRR | 0.6842 | **0.8688** | 0.8542 | 0.8449 |
+| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | 0.9516 |
+| Precision@10 | 0.6145 | **0.7790** | 0.6823 | 0.7210 |
+| Latency p50 | **24 ms** | 11 ms | 57 ms | 56 ms |
+| Latency p95 | **45 ms** | 135 ms | 90 ms | 84 ms |
 
 **Key findings (cumulative):**
 - Vector (M5): NDCG +38.6% vs BM25; `exact_destination` NDCG jumped from 0.18 → 0.84 (+358%); HitRate = 1.000.
-- Hybrid (M6) — weighted sum, 50/50: overall NDCG is between BM25 and vector (0.60). A key insight: naive 50/50 fusion can *regress* from the best individual retriever when one retriever produces meaningless scores for a query class. `exact_destination` NDCG drops from 0.84 (vector) to 0.48 because 50% BM25 weight dilutes the strong vector signal with near-random BM25 rankings. Classes where BM25 also performs well (e.g., `adults_couples`) benefit from hybrid. This motivates rank-based fusion (RRF, Milestone 7), which is robust to score magnitude.
+- Hybrid (M6) — weighted sum, 50/50: overall NDCG is between BM25 and vector (0.60). Naive 50/50 fusion can *regress* from the best individual retriever when one retriever produces meaningless scores for a query class. `exact_destination` NDCG drops from 0.84 (vector) to 0.48.
+- Hybrid (M7) — RRF (k=60): beats weighted-sum (+3.9% NDCG, +5.7% Precision) by using rank positions instead of raw scores. `exact_destination` recovers from 0.48 to 0.53; `activities` beats vector (0.40 vs 0.38). Still below pure vector overall — RRF cannot fully overcome a retriever with random ordering. Next: cross-encoder reranking (M8) as a second pass over top-50 RRF candidates.
 
 Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
@@ -138,8 +139,11 @@ make evaluate
 # Run vector evaluation (requires: make generate-embeddings first)
 uv run python scripts/evaluate.py --strategy vector
 
-# Run hybrid evaluation (requires: make generate-embeddings first)
+# Run hybrid weighted-sum evaluation
 uv run python scripts/evaluate.py --strategy hybrid
+
+# Run hybrid RRF evaluation (Milestone 7)
+uv run python scripts/evaluate.py --strategy rrf
 ```
 
 ---
@@ -158,7 +162,7 @@ Available endpoints:
 | `GET /health` | OpenSearch connectivity check |
 | `GET /search/lexical?q=...` | BM25 lexical search |
 | `GET /search/vector?q=...` | Dense vector (ANN) search |
-| `GET /search/hybrid?q=...` | Hybrid BM25 + vector (weighted sum fusion) |
+| `GET /search/hybrid?q=...` | Hybrid BM25 + vector (weighted-sum or RRF fusion) |
 
 Example searches:
 
@@ -169,8 +173,14 @@ curl "localhost:8000/search/lexical?q=family+beach+resort&country=Spain&family_f
 # Vector — semantic match (finds Tenerife hotels even without the word in description)
 curl "localhost:8000/search/vector?q=sunny+beach+holiday+in+the+Canary+Islands"
 
-# Hybrid — combines BM25 and vector via weighted sum fusion
+# Hybrid — weighted-sum fusion (default)
 curl "localhost:8000/search/hybrid?q=romantic+adults-only+resort+with+infinity+pool&country=Spain&adults_only=true"
+
+# Hybrid — RRF fusion (Milestone 7); rank-based, robust to score-scale differences
+curl "localhost:8000/search/hybrid?q=hotels+in+Tenerife&fusion=rrf"
+
+# Hybrid — RRF with custom k (smaller k amplifies top-rank advantage)
+curl "localhost:8000/search/hybrid?q=luxury+spa+retreat&fusion=rrf&rrf_k=10"
 ```
 
 Response shape:
@@ -214,8 +224,10 @@ Supported query parameters:
 | `month` | string | Available month (e.g. `July`) |
 | `airport` | string | Departure airport code (e.g. `MAN`) |
 | `candidate_k` | int | (hybrid only) Candidates per retriever before fusion (default: 50) |
-| `lexical_weight` | float | (hybrid only) BM25 score weight in fusion (default: 0.5) |
-| `vector_weight` | float | (hybrid only) Vector score weight in fusion (default: 0.5) |
+| `fusion` | string | (hybrid only) Fusion method: `weighted` (default) or `rrf` |
+| `lexical_weight` | float | (hybrid/weighted only) BM25 score weight (default: 0.5) |
+| `vector_weight` | float | (hybrid/weighted only) Vector score weight (default: 0.5) |
+| `rrf_k` | int | (hybrid/rrf only) RRF smoothing constant k (default: 60) |
 
 ---
 
@@ -281,7 +293,7 @@ src/travel_ai_search/
 │   └── ingestor.py          # Bulk ingestion: load_products(), ingest()
 ├── retrieval/
 │   ├── types.py             # Shared Hit dataclass (imported by all retrieval modules)
-│   ├── fusion.py            # build_filter_clauses(), _normalize_scores(), fuse_results()
+│   ├── fusion.py            # FusionMethod enum, fuse_results() (weighted), rrf_fuse() (RRF)
 │   ├── lexical.py           # BM25 multi-match search: lexical_search()
 │   ├── vector.py            # ANN search: vector_search(), _build_vector_query()
 │   └── hybrid.py            # Hybrid orchestration: hybrid_search(), HybridSearchParams
@@ -294,7 +306,7 @@ scripts/
 ├── ingest_data.py           # Bulk-index dataset into OpenSearch
 ├── generate_embeddings.py   # Offline: embed all hotels, update OpenSearch
 ├── build_golden_dataset.py  # Build golden evaluation dataset (one-time)
-├── evaluate.py              # Run evaluation: --strategy bm25 | vector | hybrid
+├── evaluate.py              # Run evaluation: --strategy bm25 | vector | hybrid | rrf
 └── healthcheck.py           # Verify OpenSearch connectivity
 
 data/
@@ -305,8 +317,8 @@ data/
     └── results/             # JSON evaluation results per run
 
 tests/
-├── unit/                    # No infrastructure required (230 tests)
-└── integration/             # Requires OpenSearch running (85 tests)
+├── unit/                    # No infrastructure required (243 tests)
+└── integration/             # Requires OpenSearch running (92 tests)
 ```
 
 ---

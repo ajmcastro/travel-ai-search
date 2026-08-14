@@ -13,6 +13,7 @@ from travel_ai_search.api.schemas.search import (
 )
 from travel_ai_search.config.settings import Settings
 from travel_ai_search.embeddings.base import EmbeddingProvider
+from travel_ai_search.retrieval.fusion import FusionMethod
 from travel_ai_search.retrieval.hybrid import HybridSearchParams, hybrid_search
 from travel_ai_search.retrieval.lexical import LexicalSearchParams, lexical_search
 from travel_ai_search.retrieval.vector import VectorSearchParams, vector_search
@@ -106,8 +107,10 @@ def hybrid_search_endpoint(
     q: str = Query("", description="Free-text or natural-language search query"),
     top_k: int = Query(None, ge=1, le=100, description="Maximum results to return"),
     candidate_k: int = Query(None, ge=1, le=200, description="Candidates per retriever"),
+    fusion: FusionMethod | None = Query(None, description="Fusion method: weighted or rrf"),
     lexical_weight: float = Query(None, ge=0.0, le=1.0, description="BM25 score weight"),
     vector_weight: float = Query(None, ge=0.0, le=1.0, description="Vector score weight"),
+    rrf_k: int = Query(None, ge=1, description="RRF smoothing constant k (default: 60)"),
     country: str | None = Query(None, description="Filter by country name"),
     destination: str | None = Query(None, description="Filter by exact destination name"),
     family_friendly: bool | None = Query(None, description="Filter to family-friendly hotels"),
@@ -120,29 +123,33 @@ def hybrid_search_endpoint(
     provider: EmbeddingProvider = Depends(get_embedding_provider),
     settings: Settings = Depends(get_settings),
 ) -> HybridSearchResponse:
-    """Hybrid BM25 + vector search with min-max normalised weighted score fusion.
+    """Hybrid BM25 + vector search with configurable score fusion.
 
-    Runs BM25 and ANN search in sequence, normalises each ranked list to [0, 1],
-    then combines scores:
+    Two fusion strategies are available via the `fusion` parameter:
 
-        combined = lexical_weight × norm_bm25 + vector_weight × norm_vector
+    - **weighted** (default): min-max normalise each list to [0, 1], then
+      combine: `combined = lexical_weight × norm_bm25 + vector_weight × norm_vec`
+    - **rrf**: Reciprocal Rank Fusion (Cormack et al., 2009).
+      `RRF_score(d) = Σ_r 1/(k + rank_r(d))`.  Uses only rank positions,
+      so it is robust to retrievers with incomparable score scales.
 
-    Documents found by both retrievers rank highest; those found by only one
-    are penalised (capped at their single-retriever weight).
-
-    Example:
-        GET /search/hybrid?q=romantic+beach+retreat+in+Spain&country=Spain&adults_only=true
+    Example (weighted):
+        GET /search/hybrid?q=romantic+beach+retreat+in+Spain&country=Spain
+    Example (RRF):
+        GET /search/hybrid?q=hotels+in+Tenerife&fusion=rrf
     """
     params = HybridSearchParams(
         query=q,
         top_k=top_k if top_k is not None else settings.top_k,
         candidate_k=candidate_k if candidate_k is not None else settings.hybrid_candidate_k,
+        fusion=fusion if fusion is not None else FusionMethod(settings.hybrid_fusion),
         lexical_weight=(
             lexical_weight if lexical_weight is not None else settings.hybrid_lexical_weight
         ),
         vector_weight=(
             vector_weight if vector_weight is not None else settings.hybrid_vector_weight
         ),
+        rrf_k=rrf_k if rrf_k is not None else settings.rrf_k,
         country=country,
         destination=destination,
         family_friendly=family_friendly,

@@ -836,3 +836,119 @@ The fix: `types.py` holds the shared `Hit` dataclass. Both `lexical.py` and `fus
 | Latency p95 | 45 ms | 135 ms | 90 ms | Lower tail than vector alone |
 
 **Core learning:** Naive 50/50 weighted-sum fusion does not beat the best individual retriever when one retriever produces meaningless scores for a query class. Adding a bad signal (BM25's near-random ordering for destination queries) at 50% weight degrades results. This motivates RRF (Milestone 7), which is rank-based and robust to score magnitude.
+
+---
+
+## Milestone 7 — RRF and alternative fusion
+
+### What we added
+
+- **`FusionMethod` enum** (`retrieval/fusion.py`) — `StrEnum` with values `weighted` and `rrf`; FastAPI auto-validates it from query string parameters.
+- **`rrf_fuse(ranked_lists, *, k, top_k)`** (`retrieval/fusion.py`) — pure function implementing Reciprocal Rank Fusion (Cormack, Clarke & Buettcher, 2009). Accepts a variadic list of ranked lists, accumulates 1/(k + rank) per document per list, sorts, and truncates. No normalisation required.
+- **`_RRF_K_DEFAULT = 60`** — the empirically robust constant from the original paper.
+- **`HybridSearchParams.fusion`** and **`.rrf_k`** fields — allow the caller to select fusion strategy and tune the smoothing constant without changing code.
+- **`/search/hybrid?fusion=rrf&rrf_k=60`** — API support: `fusion` and `rrf_k` query parameters added to the hybrid endpoint.
+- **`hybrid_fusion` and `rrf_k` settings** in `config/settings.py` — enable environment-variable control over the default fusion strategy.
+- **`--strategy rrf`** in `scripts/evaluate.py` — `make_rrf_fn()` wraps hybrid search with RRF fusion; the `"rrf"` key is added to `STRATEGIES`.
+- **14 new unit tests** for `rrf_fuse()` covering: empty input, single-list score formula, multi-list accumulation, top-k truncation, source from first occurrence, k-value sensitivity, and three-list correctness.
+- **8 new integration tests** for the RRF endpoint: result type, sorting, and all filter types (family_friendly, adults_only, month) plus a semantic quality assertion.
+
+### IR concepts introduced
+
+#### The score-scale problem — why normalisation is not enough
+
+Min-max normalisation (M6) transforms each list to [0, 1] before combination. This solves the *magnitude* problem: BM25's score of 12.4 and cosine similarity of 0.76 are now both in [0, 1]. But it does not solve the *ordering* problem: after normalisation, the relative order within each list is preserved exactly. If BM25 ranks documents in a near-random order for destination queries, normalised BM25 scores are still in a near-random order — just mapped to [0, 1].
+
+Giving 50% weight to a near-random ordering is almost always worse than ignoring that retriever entirely. This is the precise failure mode observed in M6: `exact_destination` NDCG dropped from 0.84 (vector alone) to 0.48 (50/50 hybrid), because BM25's random ordering moved relevant documents down in the fused ranking.
+
+#### Reciprocal Rank Fusion — rank positions, not score values
+
+RRF (Cormack et al., 2009) avoids score values entirely. For every document *d* in the union of all ranked lists *r*:
+
+```
+RRF_score(d) = Σ_r  1 / (k + rank_r(d))
+```
+
+where `rank_r(d)` is the 1-indexed position of *d* in list *r* (documents absent from a list contribute 0). The key properties:
+
+1. **Score-scale invariance.** A document ranked 1st by BM25 contributes 1/(k+1) ≈ 0.016 regardless of whether its BM25 score is 12.4 or 0.001. The score value is discarded; only position matters.
+
+2. **Bounded contribution.** Even the top-ranked document in a bad retriever contributes at most 1/(k+1). If BM25 ranks a document 1st by chance (destination query), that contributes 0.016 — not enough to promote it over a document ranked 1st by the vector retriever (also 0.016) unless BM25 also ranks the true answer highly.
+
+3. **Natural upweighting of agreement.** A document ranked 1st by *both* retrievers scores 2/(k+1) ≈ 0.033, exactly double a document ranked 1st by only one. This reward for inter-retriever agreement is the core of RRF's success.
+
+4. **No tuning of per-retriever weights.** Weighted-sum requires choosing `lexical_weight` and `vector_weight`; the optimal weights vary by query class. RRF has one shared parameter (`k`) that controls the contribution curve globally.
+
+#### The role of k (smoothing constant)
+
+The constant `k` controls the shape of the contribution curve:
+
+```
+rank 1:   1/(k+1)
+rank 2:   1/(k+2)
+rank 5:   1/(k+5)
+rank 50:  1/(k+50)
+```
+
+With `k=60` (the Cormack et al. default):
+- Rank 1 → 0.016
+- Rank 10 → 0.014  (rank-1 is only 1.14× rank-10)
+- Rank 50 → 0.009  (rank-1 is only 1.83× rank-50)
+
+The curve is **flat**: top-ranked documents get a modest bonus over mid-ranked documents. This reflects the intuition that we don't fully trust either retriever's exact ordering — we only know that rank 1 is better than rank 50.
+
+With a smaller `k` (e.g., `k=10`):
+- Rank 1 → 0.091
+- Rank 10 → 0.050  (rank-1 is 1.82× rank-10)
+- Rank 50 → 0.017  (rank-1 is 5.4× rank-50)
+
+The curve is **steeper**: top-ranked documents dominate. Smaller `k` is useful when you trust the retrievers' top rankings more and want to amplify their agreement.
+
+`k=60` is a robust default that works across diverse retrieval systems without dataset-specific tuning. The `rrf_k` configuration field exposes this for experimentation.
+
+#### Extensibility to N lists — multi-query preview
+
+`rrf_fuse` accepts `ranked_lists: list[list[Hit]]` — a list of any number of ranked lists. Two lists (BM25 + vector) is the M7 use case. Three or more lists are the Milestone 11 (multi-query) use case: generate N reformulations of the original query, run each through BM25 and/or vector retrieval, and fuse all N result lists with a single `rrf_fuse` call. The interface requires no change:
+
+```python
+# M7 (two lists)
+rrf_fuse([lex_hits, vec_hits], k=60, top_k=10)
+
+# M11 (four lists — original + 3 query expansions, all through vector)
+rrf_fuse([vec_hits_q0, vec_hits_q1, vec_hits_q2, vec_hits_q3], k=60, top_k=10)
+```
+
+This was a deliberate design choice: making `rrf_fuse` accept N lists now costs almost nothing and avoids a breaking interface change at M11.
+
+#### `StrEnum` vs `(str, Enum)`
+
+Python 3.11 introduced `enum.StrEnum` as a direct base class for string enumerations. Prior to 3.11, the idiom was `class MyEnum(str, Enum)`. `StrEnum` is preferred in Python 3.12 (this project's target) because:
+
+- It conveys intent more clearly — the reader sees immediately that values are strings.
+- Ruff's `UP042` rule flags `(str, Enum)` as a style issue.
+- `StrEnum` members compare equal to their string values: `FusionMethod.rrf == "rrf"` is `True`, enabling direct use in FastAPI query parameter parsing without an explicit `FusionMethod(value)` conversion.
+
+### Design decisions
+
+| Decision | Choice | Alternatives considered | Rationale |
+|---|---|---|---|
+| Fusion dispatch | `FusionMethod` enum field on `HybridSearchParams` | Separate `rrf_search()` function | Single `hybrid_search()` entry point; no code duplication across filter handling, timing, or result construction. |
+| Default `k` | 60 | 10, 20, 100 | Empirically robust across document types; matches the Cormack et al. paper; configurable for experiments. |
+| Ignored weights | `lexical_weight` and `vector_weight` are stored but not used when `fusion=rrf` | Remove from params | Keeping them avoids a breaking change if callers switch between fusion methods; `hybrid.py` documents clearly that they are ignored. |
+| `rrf_fuse` signature | `ranked_lists: list[list[Hit]]` (variadic) | Two separate `lex_hits`/`vec_hits` params | Naturally extensible to N lists (M11 multi-query); more general without extra complexity. |
+| Source-ownership rule | First occurrence wins | Last occurrence, or merge | The first retriever to return a document is assumed to have the most authoritative source data; avoids arbitrary choice when both have it. |
+| `StrEnum` | Yes (`from enum import StrEnum`) | `(str, Enum)` | Pythonic for 3.12; ruff UP042; direct string comparison. |
+| Config field `hybrid_fusion` | `str` with `FusionMethod(settings.hybrid_fusion)` cast in route | `FusionMethod` directly | `pydantic-settings` parses env vars as strings; the cast validates and gives a clear error at startup if the value is invalid. |
+
+### Results summary (M7)
+
+| Metric | BM25 | Vector | Hybrid (50/50) | Hybrid (RRF) | Δ RRF vs weighted |
+|---|---|---|---|---|---|
+| NDCG@10 | 0.5007 | **0.6940** | 0.6003 | 0.6239 | +0.0236 (+3.9%) |
+| MRR | 0.6842 | **0.8688** | **0.8542** | 0.8449 | −0.0093 (−1.1%) |
+| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | 0.9516 | +0.0161 (+1.7%) |
+| exact_destination NDCG@10 | 0.1830 | **0.8392** | 0.4799 | 0.5347 | +0.0548 (+11.4%) |
+| activities NDCG@10 | 0.2808 | 0.3837 | 0.3256 | **0.4002** | +0.0746 (+22.9%) |
+| Latency p50 | **24 ms** | 11 ms | 57 ms | 56 ms | −1 ms |
+
+**Core learning:** RRF is a robust upgrade over weighted-sum (+3.9% NDCG, +5.7% Precision) with essentially no latency cost. Its key advantage — score-scale invariance — substantially mitigates the M6 regression on `exact_destination` (0.48 → 0.53) and produces the only class where a fusion method beats both individual retrievers (`activities`, 0.40 vs vector 0.38). Its limitation: a retriever with a truly random ordering still contributes 1/(k+rank) per document — RRF reduces but does not eliminate the noise. Pure vector (NDCG=0.694) still leads overall. The architecture is ready for a cross-encoder reranker (M8) as a second pass over the top-50 RRF candidates, which should push quality past the retrieval ceiling.

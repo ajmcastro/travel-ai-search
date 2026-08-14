@@ -260,3 +260,70 @@ Results are also saved as machine-readable JSON under `data/evaluation/results/`
 **Next question this raises:**
 - Will RRF (rank-based fusion) avoid the score-scale problem and outperform weighted-sum? Hypothesis: yes — RRF is robust to score meaninglessness because it only cares about *position* in the list, not *score magnitude*. (Milestone 7)
 - What lexical/vector weight ratio maximises hybrid NDCG on this dataset? The data suggest ~0.25/0.75 or 0.2/0.8 would reduce the regression on `exact_destination`. (Future: hyperparameter sweep)
+
+---
+
+### [Milestone 7] RRF vs weighted-sum hybrid
+
+**Date:** 2026-08-14
+**Hypothesis:** Reciprocal Rank Fusion (Cormack et al., 2009) will outperform the M6 50/50 weighted-sum hybrid on overall NDCG@10 — especially for `exact_destination` queries. The mechanism: RRF ignores raw score values entirely and combines only rank positions, so BM25's near-random score ordering for destination queries contributes at most one uniform 1/(k+rank) term rather than inflating the fused score with meaningless magnitude. Expected: RRF NDCG ≥ vector baseline (0.694); weighted-sum regressed to 0.600.
+
+**Configuration:**
+- index: `travel_hotels` (5,470 hotels, lucene/HNSW, cosinesimil)
+- embedding model: `all-MiniLM-L6-v2` (384d, L2-normalised)
+- fusion: Reciprocal Rank Fusion, `k=60` (Cormack et al. default)
+- `candidate_k=50` (each retriever fetches 50 candidates; RRF selects top 10 from ≤ 100 unique)
+- `rrf_k=60` — smoothing constant; rank-1 contributes 1/61 ≈ 0.016
+- strategy: `rrf` — lexical → vector → `rrf_fuse([lex_hits, vec_hits])` → top 10
+- golden dataset: 62 queries, 10 classes, 48,675 judgments
+- results file: `data/evaluation/results/rrf_<date>.json`
+
+**Results (BM25 vs Vector vs Hybrid weighted vs Hybrid RRF @ K=10, 62 queries):**
+
+| Metric | BM25 | Vector | Hybrid (50/50) | Hybrid (RRF) | Δ RRF vs weighted |
+|---|---|---|---|---|---|
+| NDCG@10 | 0.5007 | **0.6940** | 0.6003 | 0.6239 | +0.0236 (+3.9%) |
+| MRR | 0.6842 | **0.8688** | **0.8542** | 0.8449 | −0.0093 (−1.1%) |
+| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | 0.9516 | +0.0161 (+1.7%) |
+| Precision@10 | 0.6145 | **0.7790** | 0.6823 | 0.7210 | +0.0387 (+5.7%) |
+| Latency p50 | **24 ms** | 11 ms | 57 ms | 56 ms | −1 ms |
+| Latency p95 | **45 ms** | 135 ms | 90 ms | 84 ms | −6 ms |
+
+**Query-class breakdown:**
+
+| Class | n | BM25 NDCG | Vector NDCG | Hybrid NDCG | RRF NDCG | RRF best? |
+|---|---|---|---|---|---|---|
+| adults_couples | 6 | 0.8483 | 0.8923 | **0.9020** | 0.8928 | — |
+| quiet_peaceful | 5 | 0.5793 | 0.6863 | 0.6801 | **0.6922** | ✓ |
+| multi_constraint | 6 | 0.6169 | 0.7815 | 0.7035 | **0.7473** | ✓ (vs hybrid) |
+| family | 9 | 0.6243 | 0.7422 | 0.7165 | **0.7352** | ✓ (vs hybrid) |
+| luxury | 6 | 0.7026 | **0.7446** | 0.7045 | 0.6951 | — |
+| activities | 6 | 0.2808 | 0.3837 | 0.3256 | **0.4002** | ✓ best overall |
+| nightlife | 5 | 0.3452 | **0.6307** | 0.4559 | 0.5053 | ✓ (vs hybrid) |
+| natural_language | 4 | 0.5279 | **0.6056** | 0.5472 | 0.5520 | ✓ (vs hybrid) |
+| budget | 5 | 0.4343 | 0.4269 | **0.4577** | 0.4221 | — |
+| **exact_destination** | 10 | 0.1830 | **0.8392** | 0.4799 | 0.5347 | ✓ (vs hybrid) |
+
+**Surprises / observations:**
+
+1. **RRF beats weighted-sum overall (NDCG 0.6003 → 0.6239), but falls short of pure vector (0.6940).** RRF is not a silver bullet — it corrects the score-scale problem but introduces its own assumption: that every retriever's top-ranked documents are equally trustworthy. When vector rankings are highly reliable (exact_destination, nightlife) but BM25 rankings are not, RRF still gives BM25's top-ranked documents a non-negligible 1/(60+1) contribution.
+
+2. **exact_destination recovers partially (0.48 → 0.53), not fully.** This confirms the hypothesis that RRF is better than weighted-sum for this class, but does not reach vector (0.84). The residual gap: even though BM25's score *magnitude* is ignored, BM25's rank *ordering* is still random for destination queries. Documents ranked 1–5 by BM25 still contribute 0.016–0.015 each — enough to promote some wrong documents above the correct vector top-10. Vector alone is still the best retriever for this class.
+
+3. **activities: RRF beats vector (0.38 → 0.40) — the one class where BM25 genuinely helps.** Activity queries like "watersports", "hiking" contain discriminative keywords that appear in the hotel's `activities` field (indexed as `text`). BM25 correctly ranks hotels that literally list "watersports" as an activity; vector search relies on semantic proximity, which is weaker for specific activity-tag matches. RRF incorporates BM25's useful signal without the score-scale penalty, producing the only case where the fused result beats both individual retrievers.
+
+4. **quiet_peaceful: RRF beats vector (0.686 → 0.692) — small but consistent improvement.** Both retrievers perform well on this class (BM25=0.579, vector=0.686), and RRF amplifies their agreement: documents that both retrievers rank highly get accumulated RRF scores, concentrating results at the top.
+
+5. **adults_couples: RRF loses the weighted-sum advantage (0.902 → 0.893).** Weighted-sum beat vector for this class because min-max normalised scores, when both retrievers agree, concentrate combined scores on the overlapping documents. RRF accumulates uniform 1/(k+rank) terms — agreement still helps, but the "concentration" effect from score magnitude is absent. RRF's result (0.893) is still excellent, matching vector.
+
+6. **budget class regresses under both hybrid methods.** Budget queries (e.g., "value for money 4 star highly rated") require price ordering, which neither BM25 nor vector encodes. Adding BM25 — however robustly — still does not help; the correct fix is numeric `max_price` filter constraints, not retrieval ranking.
+
+7. **MRR is 1.4% lower for RRF than weighted-sum (0.8449 vs 0.8542).** MRR measures only the rank of the *first* relevant document. Weighted-sum can concentrate combined scores on a single top document more aggressively than RRF's bounded rank accumulation; this occasionally puts the first relevant document at rank 1 when RRF puts it at rank 2.
+
+8. **Latency nearly identical (56 ms vs 57 ms p50).** RRF replaces the min-max normalisation + weighted sum with a simpler accumulation loop — same asymptotic complexity, ~1 ms difference in practice.
+
+**Key finding:** RRF is a robust upgrade over weighted-sum (+3.9% NDCG, +5.7% Precision, +1.7% HitRate) with no latency cost. The score-scale problem from M6 is substantially mitigated. However, RRF cannot fully overcome a retriever that produces a *random ordering* — only zero weight (i.e., dropping the retriever entirely) would eliminate its negative influence on destination queries. The best single retriever (vector, NDCG=0.694) still beats any fusion at k=60. **A cross-encoder reranker (Milestone 8) applied to the top-50 RRF candidates should break through this ceiling** by applying a more powerful relevance model as a second pass.
+
+**Next question this raises:**
+- Does tuning `rrf_k` (smaller k → amplifies top-rank advantage; larger k → flattens) help `exact_destination`? Try `k=10`: rank-1 becomes 0.091 instead of 0.016, amplifying vector's strong top-1 advantage. Risk: amplifies BM25's random rank-1 equally.
+- Can a cross-encoder reranker (Milestone 8) applied to the top-50 RRF candidates improve NDCG? Hypothesis: yes — the reranker reads both query and document together, capturing query-document interaction that neither BM25 nor vector encodes.

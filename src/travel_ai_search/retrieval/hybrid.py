@@ -29,7 +29,7 @@ from opensearchpy import OpenSearch
 
 from travel_ai_search.embeddings.base import EmbeddingProvider
 from travel_ai_search.ingestion.index import INDEX_NAME
-from travel_ai_search.retrieval.fusion import fuse_results
+from travel_ai_search.retrieval.fusion import FusionMethod, fuse_results, rrf_fuse
 from travel_ai_search.retrieval.lexical import LexicalSearchParams, lexical_search
 from travel_ai_search.retrieval.types import Hit
 from travel_ai_search.retrieval.vector import VectorSearchParams, vector_search
@@ -51,8 +51,13 @@ class HybridSearchParams:
     query: str
     top_k: int = 10
     candidate_k: int = 50
+    # ── Fusion ──────────────────────────────────────────────────────────────
+    fusion: FusionMethod = FusionMethod.weighted
+    # Weighted-sum only — ignored when fusion=rrf
     lexical_weight: float = 0.5
     vector_weight: float = 0.5
+    # RRF only — ignored when fusion=weighted
+    rrf_k: int = 60
     # ── Filters ─────────────────────────────────────────────────────────────
     country: str | None = None
     destination: str | None = None
@@ -126,13 +131,21 @@ def hybrid_search(
 
     # ── Stage 3: fusion ───────────────────────────────────────────────────────
     pool_size = len({h.id for h in lex_result.hits} | {h.id for h in vec_result.hits})
-    hits = fuse_results(
-        lex_result.hits,
-        vec_result.hits,
-        lexical_weight=params.lexical_weight,
-        vector_weight=params.vector_weight,
-        top_k=params.top_k,
-    )
+
+    if params.fusion == FusionMethod.rrf:
+        hits = rrf_fuse(
+            [lex_result.hits, vec_result.hits],
+            k=params.rrf_k,
+            top_k=params.top_k,
+        )
+    else:
+        hits = fuse_results(
+            lex_result.hits,
+            vec_result.hits,
+            lexical_weight=params.lexical_weight,
+            vector_weight=params.vector_weight,
+            top_k=params.top_k,
+        )
 
     took_ms = int((time.monotonic() - t_start) * 1000)
 

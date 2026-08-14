@@ -3,7 +3,8 @@
 Usage:
     uv run python scripts/evaluate.py                      # BM25 (default)
     uv run python scripts/evaluate.py --strategy vector    # Vector ANN
-    uv run python scripts/evaluate.py --strategy hybrid    # Hybrid BM25 + vector
+    uv run python scripts/evaluate.py --strategy hybrid    # Hybrid weighted-sum
+    uv run python scripts/evaluate.py --strategy rrf       # Hybrid RRF
     uv run python scripts/evaluate.py --strategy bm25
     uv run python scripts/evaluate.py --k 10 --no-save     # skip JSON output
     uv run python scripts/evaluate.py --golden data/evaluation/golden_queries.jsonl
@@ -30,6 +31,7 @@ from travel_ai_search.embeddings.local import LocalEmbeddingProvider
 from travel_ai_search.evaluation.dataset import load_dataset
 from travel_ai_search.evaluation.evaluator import EvaluationReport, evaluate
 from travel_ai_search.infrastructure.opensearch import create_client
+from travel_ai_search.retrieval.fusion import FusionMethod
 from travel_ai_search.retrieval.hybrid import HybridSearchParams, hybrid_search
 from travel_ai_search.retrieval.lexical import LexicalSearchParams, lexical_search
 from travel_ai_search.retrieval.vector import VectorSearchParams, vector_search
@@ -98,10 +100,40 @@ def make_hybrid_fn(
     return search
 
 
+def make_rrf_fn(
+    client: Any,
+    index: str,
+    embedding_provider: Any = None,
+    rrf_k: int = 60,
+    candidate_k: int = 50,
+    **_: Any,
+) -> Any:
+    """Return a SearchFn that calls hybrid (BM25 + vector) search with RRF fusion.
+
+    rrf_k and candidate_k can be adjusted for experimentation.
+    """
+    provider = embedding_provider
+
+    def search(query_text: str, top_k: int, filters: dict[str, Any]) -> list[str]:
+        params = HybridSearchParams(
+            query=query_text,
+            top_k=top_k,
+            candidate_k=candidate_k,
+            fusion=FusionMethod.rrf,
+            rrf_k=rrf_k,
+            **filters,
+        )
+        result = hybrid_search(client, provider, params, index=index)
+        return [hit.id for hit in result.hits]
+
+    return search
+
+
 STRATEGIES: dict[str, Any] = {
     "bm25": make_bm25_fn,
     "vector": make_vector_fn,
     "hybrid": make_hybrid_fn,
+    "rrf": make_rrf_fn,
 }
 
 
@@ -223,7 +255,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # Load embedding model if needed
     embedding_provider = None
-    if args.strategy in ("vector", "hybrid"):
+    if args.strategy in ("vector", "hybrid", "rrf"):
         print(f"\nLoading embedding model '{settings.embedding_model_name}' …")
         embedding_provider = LocalEmbeddingProvider(settings.embedding_model_name)
         print(f"  dimension={embedding_provider.dimension}")
