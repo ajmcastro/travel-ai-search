@@ -5,6 +5,7 @@ Resources created once at startup and stored on app.state:
   embedding_provider         — sentence-transformers model (loaded once; ~1-2 s on first run)
   reranker                   — cross-encoder model (None when reranking_enabled=False)
   query_understanding_engine — rule-based QU engine (always created; pure Python, no I/O)
+  query_rewriter             — LLM-based query rewriter (None when query_rewriting_enabled=False)
 
 All route handlers receive these via dependency functions in deps.py.
 """
@@ -25,6 +26,7 @@ from travel_ai_search.embeddings.local import LocalEmbeddingProvider
 from travel_ai_search.infrastructure.opensearch import create_client
 from travel_ai_search.query_understanding.base import QueryUnderstandingEngine
 from travel_ai_search.query_understanding.extractor import RuleBasedQueryUnderstandingEngine
+from travel_ai_search.query_understanding.rewriter import QueryRewriter
 from travel_ai_search.reranking.base import Reranker
 
 logger = logging.getLogger(__name__)
@@ -38,6 +40,30 @@ def _create_embedding_provider(settings: Settings) -> EmbeddingProvider:
 def _create_query_understanding_engine(settings: Settings) -> QueryUnderstandingEngine:
     """Factory — separated from lifespan so tests can patch it cheaply."""
     return RuleBasedQueryUnderstandingEngine()
+
+
+def _create_query_rewriter(settings: Settings) -> QueryRewriter | None:
+    """Factory — returns None when query rewriting is disabled.
+
+    Graceful degradation: a failed provider load logs a warning and the system
+    continues without rewriting.  The llm_provider setting selects the backend:
+    'local' (keyword expansion, no deps), 'echo' (identity stub, for testing),
+    'bedrock' (Milestone 12).
+    """
+    if not settings.query_rewriting_enabled:
+        return None
+    try:
+        from travel_ai_search.llm.local import EchoLLMProvider, LocalLLMProvider
+
+        llm = EchoLLMProvider() if settings.llm_provider == "echo" else LocalLLMProvider()
+        return QueryRewriter(llm)
+    except Exception as exc:
+        logger.warning(
+            "Failed to create query rewriter ('%s'): %s — rewriting disabled.",
+            settings.llm_provider,
+            exc,
+        )
+        return None
 
 
 def _create_reranker(settings: Settings) -> Reranker | None:
@@ -68,6 +94,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.embedding_provider = _create_embedding_provider(settings)
     app.state.reranker = _create_reranker(settings)
     app.state.query_understanding_engine = _create_query_understanding_engine(settings)
+    app.state.query_rewriter = _create_query_rewriter(settings)
     yield
     app.state.os_client.close()
 

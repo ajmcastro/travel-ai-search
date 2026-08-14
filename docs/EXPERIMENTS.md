@@ -457,3 +457,69 @@ Results are also saved as machine-readable JSON under `data/evaluation/results/`
 - Can a confidence threshold on extracted constraints reduce false positives (e.g., only apply min_star_rating if the phrasing is unambiguous)?
 - M10 (LLM rewriting): would an LLM engine improve the `budget` and `family` class by understanding that "4-star value" is a preference, not a hard filter?
 - Combining QU + reranking: does the better-filtered candidate pool (from QU) improve the reranker's output quality beyond just the RRF+rerank baseline?
+
+---
+
+### [Milestone 10] Query rewriting: LocalLLMProvider keyword expansion vs query understanding
+
+**Date:** 2026-08-14
+**Hypothesis:** Expanding the semantic query (post-QU) with domain synonym expansion before retrieval will improve recall (HitRate@10) by matching more vocabulary in hotel descriptions, at possible cost to ranking precision (NDCG) due to a noisier query embedding centroid.
+
+**Configuration:**
+- index: `travel_hotels` (5,470 hotels)
+- embedding model: `all-MiniLM-L6-v2` (384-dim)
+- QU engine: `RuleBasedQueryUnderstandingEngine` (same as M9 `understand` strategy)
+- rewriter: `QueryRewriter(LocalLLMProvider())` — keyword synonym expansion; no real LLM
+- hybrid: RRF fusion, k=60, candidate_k=50
+- key design: ground-truth filters IGNORED; constraints extracted from query_text; rewriting applied to semantic_query only (hard constraints handled separately by QU)
+
+**Results:**
+
+| Metric | RRF | Understand | **Rewrite** |
+|---|---|---|---|
+| NDCG@10 | 0.6239 | **0.6312** | 0.6130 |
+| MRR | 0.8449 | **0.8620** | 0.8226 |
+| HitRate@10 | 0.9516 | 0.9355 | **0.9677** |
+| Precision@10 | 0.7210 | **0.7290** | 0.7242 |
+| Latency p50 | 56 ms | 45 ms | 54 ms |
+| Latency p95 | 84 ms | 71 ms | 98 ms |
+
+**Query-class breakdown (Rewrite vs Understand):**
+
+| Class | n | Understand NDCG | Rewrite NDCG | Δ | Winner |
+|---|---|---|---|---|---|
+| adults_couples | 6 | **0.9721** | 0.8627 | −0.1094 (−11.2%) | Understand |
+| budget | 5 | 0.3445 | **0.3535** | +0.0090 (+2.6%) | ✓ Rewrite |
+| quiet_peaceful | 5 | **0.6922** | 0.6731 | −0.0191 (−2.8%) | Understand |
+| family | 9 | 0.6900 | **0.7196** | +0.0296 (+4.3%) | ✓ Rewrite |
+| multi_constraint | 6 | **0.7627** | 0.7639 | +0.0012 (+0.2%) | Tie |
+| exact_destination | 10 | **0.5962** | 0.6203 | +0.0241 (+4.0%) | ✓ Rewrite |
+| luxury | 6 | **0.6951** | 0.6526 | −0.0425 (−6.1%) | Understand |
+| activities | 6 | 0.4002 | **0.4580** | +0.0578 (+14.4%) | ✓ Rewrite |
+| nightlife | 5 | **0.4981** | 0.3092 | −0.1889 (−37.9%) | Understand |
+| natural_language | 4 | **0.5778** | 0.5562 | −0.0216 (−3.7%) | Understand |
+
+**Surprises / observations:**
+
+1. **HitRate@10 improves (+3.4%, 0.9355 → 0.9677).** More queries have at least one relevant hotel in the top 10. This confirms the recall hypothesis: synonym expansion broadens the vocabulary match and surfaces hotels that semantic search would have missed. But the NDCG regression shows those extra hotels rank lower.
+
+2. **NDCG and MRR regress vs understand (−2.9%, −4.6%).** Adding synonyms like "coastal, seaside, sandy beach" to "beach holiday" shifts the query embedding centroid. This makes the vector less precisely aligned with the original intent and admits hotels that merely mention coastal terms without being ideal beach hotels. Ranking suffers because the rewritten query becomes more ambiguous.
+
+3. **activities class: largest gain (+14.4%).** Activities queries ("hiking adventure holidays", "water sports beach") benefit most from synonym expansion because hotel descriptions use varied vocabulary: "trekking", "walking trails", "watersports", "aquatic". The expansion bridges the terminology gap that both BM25 and vector search struggle with in this class.
+
+4. **nightlife class: severe regression (−37.9%).** The `nightlife` expansion table maps "nightlife" → "bars, clubs, entertainment". For queries like "young party holiday summer beach", the vector embedding of "nightlife bars clubs entertainment beach" becomes generic entertainment-focused rather than the specific party-resort context. The golden relevant hotels for nightlife queries likely have strong "party resort" and "lively atmosphere" signals that the expanded query dilutes.
+
+5. **adults_couples regression (−11.2%).** Understand extracted `adults_only=True` as a hard filter, boosting adults_couples NDCG strongly in M9 (+8.9% over RRF). Rewrite does the same QU step, but the synonym expansion adds "couples, romantic" to queries already handled well by the `adults_only` filter — minor noise. The real cause of the gap is that the expansion terms ("adults-only, couples") are less specific than the hard boolean filter, and the expansion slightly dilutes the vector embedding.
+
+6. **family class improves (+4.3% over understand).** Family queries that had marginal QU extraction (e.g., "family holidays" → `family_friendly=True`) now benefit from expanded vocabulary: "family-friendly, children, kids" terms in the rewritten query boost BM25 matching on hotel descriptions that use those exact phrases. This partially offsets the false-positive filter issue from M9.
+
+7. **LocalLLMProvider is NOT a real LLM.** The expansion is keyword-based and deterministic. It cannot handle creative queries ("something like Mallorca but quieter"), correct awkward residual text from QU, or infer semantic context. The architecture is correct; the provider is a baseline stub. BedrockLLMProvider (Milestone 12) will replace it with Claude/Titan for real evaluation.
+
+8. **Latency: 54 ms p50 (between RRF 56 ms and Understand 45 ms).** The rewriting step is sub-millisecond (pure Python dictionary lookup), so latency is essentially the same as understand + the slightly longer rewritten query for BM25/vector evaluation.
+
+**Key finding:** `LocalLLMProvider` keyword expansion improves HitRate@10 (+3.4%) and activities class (+14.4%) but regresses NDCG and MRR. This is the classic precision-recall tradeoff of naive query expansion — good for recall, bad for ranking precision. A real LLM (M12) would produce targeted paraphrases that improve both, not just recall. The architecture (LLMProvider → QueryRewriter → retrieval) is now in place for M12 to drop in a real provider.
+
+**Next question this raises:**
+- M12 (Bedrock): replacing LocalLLMProvider with Claude Sonnet should produce targeted, context-aware rewrites that improve NDCG without the recall-precision tradeoff.
+- Can confidence-weighted rewriting (partially blend original and rewritten embeddings) balance precision and recall?
+- Expansion for the nightlife class clearly needs a different term set — custom domain-specific expansion tables per query class?

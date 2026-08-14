@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 9 — Query understanding and structured constraints
+## Current status: Milestone 10 — Query rewriting
 
 | # | Milestone | Status |
 |---|---|---|
@@ -19,24 +19,24 @@ An educational, production-quality project demonstrating modern AI search archit
 | 6 | Hybrid retrieval | ✅ Complete |
 | 7 | RRF and alternative fusion | ✅ Complete |
 | 8 | Cross-encoder reranking | ✅ Complete |
-| 9 | Query understanding and structured constraints | ✅ **Complete** |
-| 10 | Query rewriting | Pending |
+| 9 | Query understanding and structured constraints | ✅ Complete |
+| 10 | Query rewriting | ✅ **Complete** |
 | 11 | Multi-query retrieval | Pending |
 | 12 | AWS Bedrock providers | Pending |
 | 13 | RAG / travel knowledge base | Pending |
 | 14 | Graph-enhanced retrieval prototype | Pending |
 | 15 | Production API, observability, resilience | Pending |
 
-### BM25 vs Vector vs Hybrid vs RRF vs Rerank vs Understand (K=10, 62 queries, 10 query classes)
+### BM25 vs Vector vs Hybrid vs RRF vs Rerank vs Understand vs Rewrite (K=10, 62 queries, 10 query classes)
 
-| Metric | BM25 | Vector | Hybrid (50/50) | RRF | Rerank | Understand |
-|---|---|---|---|---|---|---|
-| NDCG@10 | 0.5007 | 0.6940 | 0.6003 | 0.6239 | **0.6830** | 0.6312 |
-| MRR | 0.6842 | 0.8688 | 0.8542 | 0.8449 | 0.8191 | **0.8620** |
-| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | **0.9516** | **0.9516** | 0.9355 |
-| Precision@10 | 0.6145 | 0.7790 | 0.6823 | 0.7210 | **0.7935** | 0.7290 |
-| Latency p50 | 24 ms | 11 ms | 57 ms | 56 ms | 113 ms | **45 ms** |
-| Latency p95 | 45 ms | 135 ms | 90 ms | 84 ms | 142 ms | **71 ms** |
+| Metric | BM25 | Vector | Hybrid (50/50) | RRF | Rerank | Understand | Rewrite |
+|---|---|---|---|---|---|---|---|
+| NDCG@10 | 0.5007 | 0.6940 | 0.6003 | 0.6239 | **0.6830** | 0.6312 | 0.6130 |
+| MRR | 0.6842 | 0.8688 | 0.8542 | 0.8449 | 0.8191 | **0.8620** | 0.8226 |
+| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | 0.9516 | 0.9516 | 0.9355 | **0.9677** |
+| Precision@10 | 0.6145 | 0.7790 | 0.6823 | 0.7210 | **0.7935** | 0.7290 | 0.7242 |
+| Latency p50 | 24 ms | 11 ms | 57 ms | 56 ms | 113 ms | **45 ms** | 54 ms |
+| Latency p95 | 45 ms | 135 ms | 90 ms | 84 ms | 142 ms | **71 ms** | 98 ms |
 
 **Key findings (cumulative):**
 - Vector (M5): NDCG +38.6% vs BM25; `exact_destination` NDCG jumped from 0.18 → 0.84 (+358%); HitRate = 1.000.
@@ -44,6 +44,7 @@ An educational, production-quality project demonstrating modern AI search archit
 - Hybrid (M7) — RRF (k=60): beats weighted-sum (+3.9% NDCG, +5.7% Precision) by using rank positions instead of raw scores. `exact_destination` recovers from 0.48 to 0.53; `activities` beats vector (0.40 vs 0.38). Still below pure vector overall.
 - Rerank (M8) — RRF + cross-encoder (`ms-marco-MiniLM-L-6-v2`, 50 candidates): **highest NDCG overall (0.683)**. `exact_destination` jumps from 0.53 to 0.79 (+48%); `activities` from 0.40 to 0.57 (+43%). Cost: ~57 ms extra latency.
 - Understand (M9) — rule-based QU + RRF: beats RRF on NDCG (+1.2%) and MRR (+2.0%) while being **20% faster** (45 ms vs 56 ms p50). `adults_couples` NDCG +8.9% (correct `adults_only` filter extracted). Main failure: false-positive constraints on `budget` queries (−18.4%).
+- Rewrite (M10) — QU + `LocalLLMProvider` keyword expansion + RRF: **HitRate improves +3.4%** (more relevant hotels in top-10) but NDCG and MRR regress vs Understand (−2.9%, −4.6%). Classic precision-recall tradeoff: naive synonym expansion broadens recall but dilutes the ranking signal. `activities` class +14.4%. Architecture ready for real LLM (M12).
 
 Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
@@ -154,6 +155,9 @@ uv run python scripts/evaluate.py --strategy rerank
 # Run query understanding evaluation: rule-based QU + RRF (Milestone 9)
 # Ignores ground-truth filters; extracts constraints from query text only
 uv run python scripts/evaluate.py --strategy understand
+
+# Run query rewriting evaluation: QU + LocalLLMProvider keyword expansion + RRF (Milestone 10)
+uv run python scripts/evaluate.py --strategy rewrite
 ```
 
 ---
@@ -173,7 +177,7 @@ Available endpoints:
 | `GET /search/lexical?q=...` | BM25 lexical search |
 | `GET /search/vector?q=...` | Dense vector (ANN) search |
 | `GET /search/hybrid?q=...` | Hybrid BM25 + vector (weighted-sum or RRF fusion) |
-| `POST /search` | Full pipeline: QU → hybrid RRF → optional reranking |
+| `POST /search` | Full pipeline: QU → optional rewriting → hybrid RRF → optional reranking |
 | `POST /query/understand` | Inspect query understanding extraction result |
 
 Example searches:
@@ -210,6 +214,12 @@ curl -X POST "localhost:8000/search" \
 curl -X POST "localhost:8000/query/understand" \
   -H "Content-Type: application/json" \
   -d '{"query": "adults only luxury spa resort in Santorini"}'
+
+# Full pipeline with query rewriting enabled (Milestone 10)
+# Requires: QUERY_REWRITING_ENABLED=true in .env
+curl -X POST "localhost:8000/search" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "something quiet with a pool", "rewrite": true}'
 ```
 
 Response shape:
@@ -259,6 +269,7 @@ Supported query parameters:
 | `rrf_k` | int | (hybrid/rrf only) RRF smoothing constant k (default: 60) |
 | `rerank` | bool | (hybrid only) Apply cross-encoder reranking to top candidates (default: false) |
 | `rerank_k` | int | (hybrid/rerank only) Candidates to pass to the cross-encoder (default: 50) |
+| `rewrite` | bool | (POST /search only) Apply query rewriting before retrieval; requires `QUERY_REWRITING_ENABLED=true` (default: false) |
 
 ---
 
@@ -300,6 +311,8 @@ Copy `.env.example` to `.env` (or run `make env`) and adjust as needed. All sett
 | `RERANKER_MODEL_NAME` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder model (~86 MB download) |
 | `RERANK_K` | `50` | Default candidates to pass to the cross-encoder |
 | `QUERY_UNDERSTANDING_ENABLED` | `true` | Enable rule-based QU engine at startup (pure Python; no download needed) |
+| `QUERY_REWRITING_ENABLED` | `false` | Enable query rewriter at startup (set `true` to allow `rewrite=true` on POST /search) |
+| `LLM_PROVIDER` | `local` | LLM backend: `local` (keyword expansion), `echo` (identity stub), `bedrock` (M12) |
 
 ---
 
@@ -327,10 +340,14 @@ src/travel_ai_search/
 ├── ingestion/
 │   ├── index.py             # OpenSearch index mapping and CRUD (knn_vector)
 │   └── ingestor.py          # Bulk ingestion: load_products(), ingest()
+├── llm/
+│   ├── base.py              # LLMProvider Protocol (runtime_checkable)
+│   └── local.py             # EchoLLMProvider (identity stub), LocalLLMProvider (keyword expansion)
 ├── query_understanding/
 │   ├── base.py              # QueryUnderstandingEngine Protocol (runtime_checkable)
 │   ├── models.py            # QueryUnderstanding dataclass + to_search_filters()
-│   └── extractor.py         # RuleBasedQueryUnderstandingEngine (regex + keyword lookup)
+│   ├── extractor.py         # RuleBasedQueryUnderstandingEngine (regex + keyword lookup)
+│   └── rewriter.py          # QueryRewriter (wraps LLMProvider; graceful fallback)
 ├── reranking/
 │   ├── base.py              # Reranker Protocol (runtime_checkable, structural typing)
 │   └── local.py             # LocalCrossEncoderReranker (sentence-transformers CrossEncoder)
@@ -349,7 +366,7 @@ scripts/
 ├── ingest_data.py           # Bulk-index dataset into OpenSearch
 ├── generate_embeddings.py   # Offline: embed all hotels, update OpenSearch
 ├── build_golden_dataset.py  # Build golden evaluation dataset (one-time)
-├── evaluate.py              # Run evaluation: --strategy bm25 | vector | hybrid | rrf | rerank
+├── evaluate.py              # Run evaluation: --strategy bm25|vector|hybrid|rrf|rerank|understand|rewrite
 └── healthcheck.py           # Verify OpenSearch connectivity
 
 data/
@@ -360,8 +377,8 @@ data/
     └── results/             # JSON evaluation results per run
 
 tests/
-├── unit/                    # No infrastructure required (312 tests)
-└── integration/             # Requires OpenSearch running (117 tests)
+├── unit/                    # No infrastructure required (342 tests)
+└── integration/             # Requires OpenSearch running (124 tests)
 ```
 
 ---

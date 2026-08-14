@@ -14,6 +14,7 @@ from travel_ai_search.config.settings import Settings
 from travel_ai_search.config.settings import get_settings as _get_settings
 from travel_ai_search.embeddings.base import EmbeddingProvider
 from travel_ai_search.query_understanding.base import QueryUnderstandingEngine
+from travel_ai_search.query_understanding.rewriter import QueryRewriter
 from travel_ai_search.reranking.base import Reranker
 
 
@@ -43,6 +44,15 @@ def get_query_understanding_engine(request: Request) -> QueryUnderstandingEngine
     """Return the shared query understanding engine stored on app state at startup."""
     engine: QueryUnderstandingEngine = request.app.state.query_understanding_engine
     return engine
+
+
+def get_query_rewriter(request: Request) -> QueryRewriter | None:
+    """Return the shared query rewriter stored on app state, or None if not created.
+
+    The rewriter is None when query_rewriting_enabled=False in settings.
+    Route handlers that accept an optional rewriter must check for None before use.
+    """
+    return getattr(request.app.state, "query_rewriter", None)
 
 
 def get_settings() -> Settings:

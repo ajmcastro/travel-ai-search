@@ -67,6 +67,15 @@ class Settings(BaseSettings):
     #   exists to allow disabling it (e.g. for A/B testing) without code changes.
     query_understanding_enabled: bool = True
 
+    # Query rewriting (Milestone 10)
+    # query_rewriting_enabled: set True to create a QueryRewriter at startup.
+    #   When False, the rewriter is never created and rewrite=true in POST /search
+    #   is silently ignored (retrieval uses the semantic_query as-is).
+    # llm_provider: which local provider to use — "local" (keyword expansion) or
+    #   "echo" (identity stub, for testing).  "bedrock" is added in Milestone 12.
+    query_rewriting_enabled: bool = False
+    llm_provider: str = "local"
+
 
 @lru_cache
 def get_settings() -> Settings:

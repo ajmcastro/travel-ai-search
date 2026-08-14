@@ -12,7 +12,9 @@ from opensearchpy import OpenSearch
 
 from travel_ai_search.api.app import app
 from travel_ai_search.embeddings.local import LocalEmbeddingProvider
+from travel_ai_search.llm.local import EchoLLMProvider, LocalLLMProvider
 from travel_ai_search.query_understanding.extractor import RuleBasedQueryUnderstandingEngine
+from travel_ai_search.query_understanding.rewriter import QueryRewriter
 
 pytestmark = pytest.mark.integration
 
@@ -31,6 +33,7 @@ def api_client(
     from travel_ai_search.api.deps import (
         get_embedding_provider,
         get_os_client,
+        get_query_rewriter,
         get_query_understanding_engine,
         get_reranker,
         get_settings,
@@ -49,6 +52,10 @@ def api_client(
     def _override_qu_engine() -> RuleBasedQueryUnderstandingEngine:
         return RuleBasedQueryUnderstandingEngine()
 
+    def _override_rewriter() -> QueryRewriter | None:
+        # Expose a LocalLLMProvider-backed rewriter so rewrite=true tests work
+        return QueryRewriter(LocalLLMProvider())
+
     def _override_settings() -> Settings:
         s = Settings()
         # Point to the vector test index which has embeddings
@@ -59,6 +66,7 @@ def api_client(
     app.dependency_overrides[get_embedding_provider] = _override_provider
     app.dependency_overrides[get_reranker] = _override_reranker
     app.dependency_overrides[get_query_understanding_engine] = _override_qu_engine
+    app.dependency_overrides[get_query_rewriter] = _override_rewriter
     app.dependency_overrides[get_settings] = _override_settings
 
     with TestClient(app) as client:
@@ -207,3 +215,76 @@ def test_full_search_original_query_preserved(api_client: TestClient) -> None:
     resp = api_client.post("/search", json={"query": query})
     data = resp.json()
     assert data["query_understanding"]["original_query"] == query
+
+
+# ── POST /search — query rewriting (Milestone 10) ─────────────────────────────
+
+
+def test_full_search_rewrite_false_has_null_rewritten_query(api_client: TestClient) -> None:
+    resp = api_client.post("/search", json={"query": "beach hotel", "rewrite": False})
+    data = resp.json()
+    assert data["rewritten_query"] is None
+
+
+def test_full_search_rewrite_default_is_false(api_client: TestClient) -> None:
+    resp = api_client.post("/search", json={"query": "beach hotel"})
+    data = resp.json()
+    assert data["rewritten_query"] is None
+
+
+def test_full_search_rewrite_true_returns_rewritten_query(api_client: TestClient) -> None:
+    resp = api_client.post("/search", json={"query": "beach resort", "rewrite": True})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "rewritten_query" in data
+    assert data["rewritten_query"] is not None
+
+
+def test_full_search_rewrite_true_expands_query(api_client: TestClient) -> None:
+    # LocalLLMProvider should add synonyms for "beach", making rewritten longer
+    query = "beach resort"
+    resp = api_client.post("/search", json={"query": query, "rewrite": True})
+    data = resp.json()
+    # Rewritten query should be longer than the semantic_query (expansion happened)
+    semantic = data["query_understanding"]["semantic_query"]
+    rewritten = data["rewritten_query"]
+    assert rewritten is not None
+    assert len(rewritten) >= len(semantic)
+
+
+def test_full_search_rewrite_preserves_country_filter(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/search",
+        json={"query": "beach hotel in Spain", "rewrite": True},
+    )
+    data = resp.json()
+    # Hard constraints from QU must still be applied
+    for hit in data["hits"]:
+        assert hit["country"] == "Spain"
+
+
+def test_full_search_rewrite_returns_200(api_client: TestClient) -> None:
+    resp = api_client.post("/search", json={"query": "spa wellness retreat", "rewrite": True})
+    assert resp.status_code == 200
+
+
+def test_full_search_rewrite_with_echo_provider(api_client: TestClient) -> None:
+    from travel_ai_search.api.deps import get_query_rewriter
+
+    echo_rewriter = QueryRewriter(EchoLLMProvider())
+
+    def _echo_override() -> QueryRewriter:
+        return echo_rewriter
+
+    app.dependency_overrides[get_query_rewriter] = _echo_override
+    try:
+        resp = api_client.post("/search", json={"query": "spa resort", "rewrite": True})
+        data = resp.json()
+        semantic = data["query_understanding"]["semantic_query"]
+        # EchoLLMProvider → rewritten_query == semantic_query
+        assert data["rewritten_query"] == semantic
+    finally:
+        from travel_ai_search.llm.local import LocalLLMProvider
+        from travel_ai_search.query_understanding.rewriter import QueryRewriter as QR
+
+        app.dependency_overrides[get_query_rewriter] = lambda: QR(LocalLLMProvider())

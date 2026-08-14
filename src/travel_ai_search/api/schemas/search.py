@@ -140,6 +140,7 @@ class FullSearchRequest(BaseModel):
     fusion: FusionMethod = FusionMethod.rrf
     rerank: bool = False
     rerank_k: int | None = None
+    rewrite: bool = False
 
 
 class FullSearchResponse(BaseModel):
@@ -152,12 +153,15 @@ class FullSearchResponse(BaseModel):
     vector_took_ms: int
     reranking_took_ms: int = 0
     query_understanding: QueryUnderstandResponse
+    rewritten_query: str | None = None
 
     @classmethod
     def from_result(
         cls,
         result: HybridSearchResult,
         qu_response: QueryUnderstandResponse,
+        *,
+        rewritten_query: str | None = None,
     ) -> FullSearchResponse:
         hits = [
             SearchHit.model_validate({"id": hit.id, "score": hit.score, **hit.source})
@@ -171,4 +175,5 @@ class FullSearchResponse(BaseModel):
             vector_took_ms=result.vector_took_ms,
             reranking_took_ms=result.reranking_took_ms,
             query_understanding=qu_response,
+            rewritten_query=rewritten_query,
         )

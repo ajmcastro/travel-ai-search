@@ -8,6 +8,7 @@ from opensearchpy import OpenSearch
 from travel_ai_search.api.deps import (
     get_embedding_provider,
     get_os_client,
+    get_query_rewriter,
     get_query_understanding_engine,
     get_reranker,
     get_settings,
@@ -23,6 +24,7 @@ from travel_ai_search.api.schemas.search import (
 from travel_ai_search.config.settings import Settings
 from travel_ai_search.embeddings.base import EmbeddingProvider
 from travel_ai_search.query_understanding.base import QueryUnderstandingEngine
+from travel_ai_search.query_understanding.rewriter import QueryRewriter
 from travel_ai_search.reranking.base import Reranker
 from travel_ai_search.retrieval.fusion import FusionMethod
 from travel_ai_search.retrieval.hybrid import HybridSearchParams, hybrid_search
@@ -199,30 +201,43 @@ def full_search_endpoint(
     provider: EmbeddingProvider = Depends(get_embedding_provider),
     loaded_reranker: Reranker | None = Depends(get_reranker),
     qu_engine: QueryUnderstandingEngine = Depends(get_query_understanding_engine),
+    query_rewriter: QueryRewriter | None = Depends(get_query_rewriter),
     settings: Settings = Depends(get_settings),
 ) -> FullSearchResponse:
-    """Full orchestrated search pipeline: query understanding → hybrid RRF → optional reranking.
+    """Full orchestrated search pipeline: QU → optional rewriting → hybrid RRF → optional reranking.
 
     The query is parsed by the rule-based query understanding engine, which extracts
     hard constraints (month, departure airport, max price, star rating, family/adults
-    flags, country) and a clean semantic query.  The semantic query and extracted
-    constraints are fed into the hybrid retrieval pipeline.
+    flags, country) and a clean semantic query.
 
-    The response includes a query_understanding field so callers can see exactly
-    what was extracted from their query — useful for debugging and observability.
+    When rewrite=true and a query rewriter is configured (query_rewriting_enabled=true),
+    the semantic query is expanded or paraphrased by the LLM provider before retrieval.
+    Both the original semantic query and the rewritten form are returned in the response
+    for observability.  Rewriting failures fall back to the original semantic query.
 
     Example:
         POST /search
         {"query": "family beach holiday in Greece July from Manchester under £2000"}
+
+    Example (with rewriting):
+        POST /search
+        {"query": "something quiet with a pool", "rewrite": true}
     """
     qu = qu_engine.understand(body.query)
     qu_response = QueryUnderstandResponse.from_understanding(qu)
+
+    # Optional query rewriting: expand the semantic query using the LLM provider.
+    rewritten_query: str | None = None
+    retrieval_query = qu.semantic_query
+    if body.rewrite and query_rewriter is not None:
+        rewritten_query = query_rewriter.rewrite(qu.semantic_query)
+        retrieval_query = rewritten_query
 
     candidate_k = body.candidate_k if body.candidate_k is not None else settings.hybrid_candidate_k
     rerank_k = body.rerank_k if body.rerank_k is not None else settings.rerank_k
 
     params = HybridSearchParams(
-        query=qu.semantic_query,
+        query=retrieval_query,
         top_k=body.top_k,
         candidate_k=candidate_k,
         fusion=body.fusion,
@@ -238,4 +253,4 @@ def full_search_endpoint(
         index=settings.opensearch_index_name,
         reranker=active_reranker,
     )
-    return FullSearchResponse.from_result(result, qu_response)
+    return FullSearchResponse.from_result(result, qu_response, rewritten_query=rewritten_query)

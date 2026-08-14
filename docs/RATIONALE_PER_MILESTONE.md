@@ -1143,3 +1143,86 @@ Rule-based extraction is the right starting point: it is free, deterministic, an
 | Latency p50 | 56 ms | **45 ms** | −11 ms (−20%) |
 
 **Core learning:** Rule-based QU improves NDCG and MRR over raw RRF while also being 20% faster (semantic distillation shortens the BM25 query). The main failure mode is false-positive constraint extraction — applying a hard filter when the user expressed a preference. The `adults_couples` class shows the best-case scenario: a clear boolean intent ("adults only") maps cleanly to a structured filter. The `budget` class shows the worst case: ambiguous phrasing ("4-star value") causes an incorrect hard filter. The protocol abstraction (`QueryUnderstandingEngine`) ensures M10's LLM-based engine can be substituted without changing any routes or retrieval code.
+
+---
+
+## Milestone 10 — Query rewriting
+
+### What we added
+
+An optional **query rewriting** stage that runs between query understanding and hybrid retrieval. After the QU engine extracts hard constraints and a clean semantic query, the `QueryRewriter` passes the semantic query to an `LLMProvider` that expands or paraphrases it before retrieval.
+
+**New modules:**
+- `src/travel_ai_search/llm/` — `LLMProvider` Protocol, `EchoLLMProvider` (identity stub), `LocalLLMProvider` (keyword synonym expansion)
+- `src/travel_ai_search/query_understanding/rewriter.py` — `QueryRewriter` class
+
+**Pipeline change (POST /search with `rewrite=true`):**
+```
+user query
+  → QueryUnderstandingEngine  [as before]
+       ↓ semantic_query + hard constraints
+  → QueryRewriter (NEW)
+       ↓ rewritten_query (expanded semantic query)
+  → HybridSearchParams(query=rewritten_query, **filters)  [as before]
+```
+
+**New API fields:**
+- `FullSearchRequest.rewrite: bool = False` — opt-in rewriting per request
+- `FullSearchResponse.rewritten_query: str | None` — `None` if rewriting was not applied
+
+### IR concepts
+
+#### Vocabulary mismatch problem
+
+Users and documents use different words for the same concept. A user searching "something peaceful on an island" may not use the exact words that appear in hotel descriptions ("tranquil beachfront resort"). BM25 misses these unless the words overlap. Query rewriting bridges the gap by translating user vocabulary to document vocabulary.
+
+#### LLM-based query rewriting
+
+A language model receives the semantic query and a system prompt instructing it to:
+- Add synonyms and related domain terms
+- Paraphrase vague expressions into concrete search-friendly language
+- Preserve intent without inventing constraints
+
+Example: `"something quiet with a pool"` → `"peaceful tranquil hotel with swimming pool infinity pool"`
+
+This is more powerful than simple synonym expansion because the LLM can understand context: "something like Mallorca but quieter" cannot be handled by keyword rules (the model needs to know what Mallorca is like geographically) but is natural for a well-prompted LLM.
+
+#### Graceful degradation
+
+Any exception from the LLM provider falls back to the original semantic query — search never fails due to a rewriting error. An empty LLM response also falls back. This follows the same pattern as the reranker: opt-in, failure-safe, toggleable.
+
+#### Identity rewriter (EchoLLMProvider)
+
+The `EchoLLMProvider` returns the prompt unchanged. This is used in unit tests to verify the pipeline wiring independently of LLM quality. It also allows evaluating the pipeline overhead with zero rewriting effect, confirming that `rewrite` strategy == `understand` strategy when using EchoLLMProvider.
+
+#### Keyword expansion (LocalLLMProvider)
+
+A deterministic, zero-dependency stub that looks up known travel keywords and appends 1–3 synonyms. It is NOT a real LLM — it cannot understand context or handle creative queries. Its value is:
+- Demonstrates the provider interface that `BedrockLLMProvider` (M12) will satisfy
+- Provides a measurable baseline for the `rewrite` evaluation strategy
+- Shows the precision-recall tradeoff of naive expansion (more hits, worse ranking)
+
+### Key design decisions
+
+| Decision | Chosen | Alternatives | Reason |
+|---|---|---|---|
+| Rewrite semantic_query (not original_query) | Post-QU rewriting | Rewrite before QU | Hard constraints already extracted; no risk of rewriter disrupting constraint extraction |
+| Record both semantic_query and rewritten_query | Both in response | Only rewritten | Observability: callers can debug what QU did vs what the rewriter changed |
+| `rewrite: bool = False` per-request flag | Opt-in | Always rewrite | Different queries benefit differently; user controls the tradeoff |
+| `query_rewriting_enabled: bool = False` | Disabled by default | Enabled | LocalLLMProvider provides marginal value; avoid false impression it improves quality |
+| System prompt included in LLMProvider.generate() | `system: str = ""` kwarg | Messages list | Maps to both OpenAI and Bedrock Converse API; simpler for local providers to ignore |
+| Graceful fallback on LLM exception | Return semantic_query | Raise HTTP 500 | Consistent with reranker pattern; rewriting is enhancement, not core functionality |
+
+### Results summary (M10)
+
+| Metric | Understand | Rewrite | Δ |
+|---|---|---|---|
+| NDCG@10 | **0.6312** | 0.6130 | −0.0182 (−2.9%) |
+| MRR | **0.8620** | 0.8226 | −0.0394 (−4.6%) |
+| HitRate@10 | 0.9355 | **0.9677** | +0.0322 (+3.4%) |
+| Precision@10 | **0.7290** | 0.7242 | −0.0048 (−0.7%) |
+| activities NDCG@10 | 0.4002 | **0.4580** | +0.0578 (+14.4%) |
+| nightlife NDCG@10 | **0.4981** | 0.3092 | −0.1889 (−37.9%) |
+| Latency p50 | **45 ms** | 54 ms | +9 ms |
+
+**Core learning:** Naive keyword expansion demonstrates the classic IR expansion tradeoff — higher recall (HitRate) at the cost of ranking precision (NDCG, MRR). The recall gain comes from added synonyms matching more hotel descriptions; the precision loss comes from embedding centroid drift when synonyms are added indiscriminately. This validates the need for a real LLM (M12) that can produce targeted, context-aware rewrites rather than broad synonym lists. The `LLMProvider` protocol ensures BedrockLLMProvider can be substituted in M12 without touching routes, retrieval, or evaluation code.

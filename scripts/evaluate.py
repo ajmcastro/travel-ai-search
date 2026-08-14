@@ -6,6 +6,8 @@ Usage:
     uv run python scripts/evaluate.py --strategy hybrid    # Hybrid weighted-sum
     uv run python scripts/evaluate.py --strategy rrf       # Hybrid RRF
     uv run python scripts/evaluate.py --strategy rerank    # RRF + cross-encoder reranking
+    uv run python scripts/evaluate.py --strategy understand # QU (M9)
+    uv run python scripts/evaluate.py --strategy rewrite   # QU + query rewriting (M10)
     uv run python scripts/evaluate.py --strategy bm25
     uv run python scripts/evaluate.py --k 10 --no-save     # skip JSON output
     uv run python scripts/evaluate.py --golden data/evaluation/golden_queries.jsonl
@@ -204,6 +206,48 @@ def make_understand_fn(
     return search
 
 
+def make_rewrite_fn(
+    client: Any,
+    index: str,
+    embedding_provider: Any = None,
+    rrf_k: int = 60,
+    candidate_k: int = 50,
+    **_: Any,
+) -> Any:
+    """Return a SearchFn that combines QU + LocalLLMProvider query rewriting + RRF.
+
+    Like 'understand', this strategy extracts hard constraints from query_text and
+    ignores ground-truth filters.  In addition it rewrites the semantic query using
+    LocalLLMProvider (keyword synonym expansion) before calling hybrid RRF retrieval.
+
+    This establishes the rewrite pipeline baseline; BedrockLLMProvider (Milestone 12)
+    will replace LocalLLMProvider with a real LLM for a meaningful quality comparison.
+    """
+    from travel_ai_search.llm.local import LocalLLMProvider
+    from travel_ai_search.query_understanding.extractor import RuleBasedQueryUnderstandingEngine
+    from travel_ai_search.query_understanding.rewriter import QueryRewriter
+
+    provider = embedding_provider
+    engine = RuleBasedQueryUnderstandingEngine()
+    rewriter = QueryRewriter(LocalLLMProvider())
+
+    def search(query_text: str, top_k: int, filters: dict[str, Any]) -> list[str]:
+        qu = engine.understand(query_text)
+        retrieval_query = rewriter.rewrite(qu.semantic_query)
+        params = HybridSearchParams(
+            query=retrieval_query,
+            top_k=top_k,
+            candidate_k=candidate_k,
+            fusion=FusionMethod.rrf,
+            rrf_k=rrf_k,
+            **qu.to_search_filters(),
+        )
+        result = hybrid_search(client, provider, params, index=index)
+        return [hit.id for hit in result.hits]
+
+    return search
+
+
 STRATEGIES: dict[str, Any] = {
     "bm25": make_bm25_fn,
     "vector": make_vector_fn,
@@ -211,6 +255,7 @@ STRATEGIES: dict[str, Any] = {
     "rrf": make_rrf_fn,
     "rerank": make_rerank_fn,
     "understand": make_understand_fn,
+    "rewrite": make_rewrite_fn,
 }
 
 
@@ -332,7 +377,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # Load embedding model if needed
     embedding_provider = None
-    if args.strategy in ("vector", "hybrid", "rrf", "rerank", "understand"):
+    if args.strategy in ("vector", "hybrid", "rrf", "rerank", "understand", "rewrite"):
         print(f"\nLoading embedding model '{settings.embedding_model_name}' …")
         embedding_provider = LocalEmbeddingProvider(settings.embedding_model_name)
         print(f"  dimension={embedding_provider.dimension}")
