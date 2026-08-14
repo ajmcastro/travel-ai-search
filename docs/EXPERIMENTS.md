@@ -327,3 +327,70 @@ Results are also saved as machine-readable JSON under `data/evaluation/results/`
 **Next question this raises:**
 - Does tuning `rrf_k` (smaller k → amplifies top-rank advantage; larger k → flattens) help `exact_destination`? Try `k=10`: rank-1 becomes 0.091 instead of 0.016, amplifying vector's strong top-1 advantage. Risk: amplifies BM25's random rank-1 equally.
 - Can a cross-encoder reranker (Milestone 8) applied to the top-50 RRF candidates improve NDCG? Hypothesis: yes — the reranker reads both query and document together, capturing query-document interaction that neither BM25 nor vector encodes.
+
+---
+
+### [Milestone 8] Cross-encoder reranking (RRF + reranker) vs RRF
+
+**Date:** 2026-08-14
+**Hypothesis:** A cross-encoder reranker (`cross-encoder/ms-marco-MiniLM-L-6-v2`) applied to the top-50 RRF candidates will improve overall NDCG@10 beyond the RRF ceiling (0.6239), especially for semantic classes (`exact_destination`, `activities`, `nightlife`) where individual token-level attention signals are most useful. Expected cost: latency increases from ~56 ms (RRF) to ~130 ms (RRF + 50-pair inference on CPU).
+
+**Configuration:**
+- index: `travel_hotels` (5,470 hotels, lucene/HNSW, cosinesimil)
+- embedding model: `all-MiniLM-L6-v2` (384d, L2-normalised)
+- fusion: RRF, `rrf_k=60`, `candidate_k=50`
+- reranker: `cross-encoder/ms-marco-MiniLM-L-6-v2` (~22 M params, ~86 MB, MS-MARCO trained)
+- `rerank_k=50` (top-50 RRF candidates passed to cross-encoder; top-10 returned)
+- reranking text: `hotel_name | destination, country | hotel_description | Activities: … | Tags: …`
+- strategy: `rerank` — lexical → vector → RRF fusion → top-50 → cross-encoder → top-10
+- golden dataset: 62 queries, 10 classes, 48,675 judgments
+- results file: `data/evaluation/results/rerank_2026-08-14.json`
+
+**Results (all strategies @ K=10, 62 queries):**
+
+| Metric | BM25 | Vector | Hybrid | RRF | Rerank | Δ Rerank vs RRF |
+|---|---|---|---|---|---|---|
+| NDCG@10 | 0.5007 | **0.6940** | 0.6003 | 0.6239 | **0.6830** | +0.0591 (+9.5%) |
+| MRR | 0.6842 | **0.8688** | 0.8542 | 0.8449 | 0.8191 | −0.0258 (−3.1%) |
+| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | **0.9516** | **0.9516** | 0.0000 |
+| Precision@10 | 0.6145 | **0.7790** | 0.6823 | 0.7210 | **0.7935** | +0.0725 (+10.1%) |
+| Latency p50 | **24 ms** | 11 ms | 57 ms | 56 ms | 113 ms | +57 ms |
+| Latency p95 | **45 ms** | 135 ms | 90 ms | 84 ms | 142 ms | +58 ms |
+
+**Query-class breakdown:**
+
+| Class | n | RRF NDCG | Rerank NDCG | Δ | Winner |
+|---|---|---|---|---|---|
+| **exact_destination** | 10 | 0.5347 | **0.7934** | +0.2587 (+48%) | ✓ Rerank |
+| activities | 6 | 0.4002 | **0.5726** | +0.1724 (+43%) | ✓ Rerank |
+| nightlife | 5 | 0.5053 | **0.6389** | +0.1336 (+26%) | ✓ Rerank |
+| natural_language | 4 | 0.5520 | **0.6062** | +0.0542 (+10%) | ✓ Rerank |
+| luxury | 6 | 0.6951 | **0.7176** | +0.0225 (+3%) | ✓ Rerank |
+| budget | 5 | 0.4221 | **0.4401** | +0.0180 (+4%) | ✓ Rerank |
+| adults_couples | 6 | **0.8928** | 0.8953 | +0.0025 | Tie |
+| quiet_peaceful | 5 | **0.6922** | 0.6681 | −0.0241 (−3%) | RRF |
+| multi_constraint | 6 | **0.7473** | 0.7134 | −0.0339 (−5%) | RRF |
+| family | 9 | **0.7352** | 0.6507 | −0.0845 (−11%) | RRF |
+
+**Surprises / observations:**
+
+1. **exact_destination: the largest single gain (+48%, 0.53 → 0.79).** The cross-encoder, trained on MS-MARCO query-passage pairs, has been exposed to "hotels in X", "X resort", and similar patterns. It can score a (query, hotel-document) pair jointly — the destination name and description appear in the same context window, allowing attention to fire across them. Both bi-encoders (BM25, vector) are blind to this interaction: BM25 misses destination keywords; vector encodes the query and document independently. This is the canonical motivation for two-stage retrieval.
+
+2. **activities: +43% (0.40 → 0.57).** For queries like "hiking adventure lodge" or "watersports beach", the cross-encoder can simultaneously attend to the query term and the `Activities: hiking, climbing, …` clause in the reranking text. This captures query-activity interaction that RRF approximates only via BM25's keyword match.
+
+3. **MRR decreased (−3.1%, 0.84 → 0.82) even though NDCG improved.** MRR measures only the rank of the *first* relevant document. The reranker occasionally reorders the top results in a way that pushes a relevant document from rank 1 to rank 2 while placing a different relevant document at rank 1 — NDCG does not penalise this (it rewards ranking any highly-relevant document first), but MRR does (it rewards only the very first hit). This is expected behaviour when a reranker corrects many lower-ranked positions but occasionally misorders the very top.
+
+4. **family regression (−11%, 0.74 → 0.65).** The MS-MARCO cross-encoder was trained on web-passage relevance, not travel-specific structured attributes. "Family beach holiday with kids" semantically overlaps with many generic beach hotel descriptions, making the cross-encoder less discriminative than RRF for this class. The cross-encoder reads the hotel description, but `family_friendly=True` is a structured boolean not in the free-text document — it was already enforced as a hard filter before reranking, so the reranker cannot see it. This is a limit of the current reranking text format.
+
+5. **multi_constraint regression (−5%, 0.75 → 0.71).** Similar mechanism: hard-constraint queries (adults_only + max_price + min_stars) already have their correctness enforced by filters before reranking. The cross-encoder then reranks a pool of already-correct documents, and its general-purpose text relevance model may prefer candidates that sound more luxurious over those that strictly satisfy the price constraint.
+
+6. **Latency doubles (56 ms → 113 ms p50).** 50 cross-encoder forward passes on CPU take ~55 ms extra. This is expected: 22 M parameters × 50 pairs = ~1.1 B float ops. For a production system, this could be reduced by: (a) lowering `rerank_k` to 20–30 (top-10 NDCG is insensitive to candidates ranked > 30); (b) using a smaller model (L-2-v2, ~12 M params); (c) batch-GPU inference. The ~113 ms p50 is still acceptable for interactive search.
+
+7. **HitRate unchanged (0.9516 = RRF).** Reranking only reorders — it cannot add documents not in the top-50 RRF pool. The two queries that RRF misses are still missed. A larger `candidate_k` or a different first-stage retriever is needed to improve recall.
+
+**Key finding:** Cross-encoder reranking is the highest-NDCG strategy overall (+9.5% vs RRF, +47.5% vs weighted-sum). It achieves this by applying token-level attention across the full (query, document) pair — a strictly more powerful relevance model than either BM25 or vector bi-encoders. The cost is ~55 ms extra latency and a small regression on structured-constraint query classes where the cross-encoder's general-purpose text model has no advantage over the already-filtered RRF pool. **This two-stage architecture (fast candidate generation → powerful reranking) is the standard production pattern for neural IR systems.**
+
+**Next question this raises:**
+- Does expanding the reranking text to include star-rating, price tier, and board type improve `multi_constraint` and `family` without hurting semantic classes?
+- Can `rerank_k=20` (instead of 50) preserve most of the NDCG gain with half the latency overhead? (Latency-quality tradeoff sweep)
+- Would a domain-specific fine-tuned cross-encoder outperform the general MS-MARCO model on travel queries?

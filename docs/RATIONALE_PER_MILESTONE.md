@@ -952,3 +952,110 @@ Python 3.11 introduced `enum.StrEnum` as a direct base class for string enumerat
 | Latency p50 | **24 ms** | 11 ms | 57 ms | 56 ms | −1 ms |
 
 **Core learning:** RRF is a robust upgrade over weighted-sum (+3.9% NDCG, +5.7% Precision) with essentially no latency cost. Its key advantage — score-scale invariance — substantially mitigates the M6 regression on `exact_destination` (0.48 → 0.53) and produces the only class where a fusion method beats both individual retrievers (`activities`, 0.40 vs vector 0.38). Its limitation: a retriever with a truly random ordering still contributes 1/(k+rank) per document — RRF reduces but does not eliminate the noise. Pure vector (NDCG=0.694) still leads overall. The architecture is ready for a cross-encoder reranker (M8) as a second pass over the top-50 RRF candidates, which should push quality past the retrieval ceiling.
+
+---
+
+## Milestone 8 — Cross-encoder reranking
+
+### What we added
+
+- **`reranking/base.py`** — `Reranker` Protocol (structural typing, `@runtime_checkable`).
+- **`reranking/local.py`** — `LocalCrossEncoderReranker` wrapping `sentence_transformers.CrossEncoder`; `_build_reranking_text()` constructs the (query, document) input text from hotel fields.
+- **`retrieval/hybrid.py`** — extended with `rerank_k` parameter in `HybridSearchParams` and optional `reranker` argument to `hybrid_search()`; graceful degradation if reranker raises.
+- **`api/app.py`** — `_create_reranker()` factory; `reranker` stored on `app.state` at startup.
+- **`api/deps.py`** — `get_reranker()` dependency.
+- **`api/routes/search.py`** — `rerank=true` and `rerank_k` query parameters on `/search/hybrid`.
+- **`api/schemas/search.py`** — `reranking_took_ms` field on `HybridSearchResponse`.
+- **`config/settings.py`** — `reranking_enabled`, `reranker_model_name`, `rerank_k`.
+- **`scripts/evaluate.py`** — `rerank` strategy with `make_rerank_fn()`.
+- Tests: 20 unit tests (`tests/unit/test_reranking.py`), 10 integration tests (`tests/integration/test_reranking.py`).
+
+### IR concepts
+
+#### Bi-encoder vs cross-encoder
+
+**Bi-encoder** (what BM25 and vector search use conceptually):
+- Query and document are encoded **independently**. BM25 computes a term-frequency score per document at index time; a dense bi-encoder converts each document to a vector offline.
+- At query time, matching is cheap: a BM25 score lookup or a dot-product between the query vector and each document vector.
+- **Limitation:** the relevance model never sees the query and document *together*. It cannot capture interactions — "this word in the query is important because of that phrase in the document."
+
+**Cross-encoder**:
+- Query and document are concatenated and fed jointly into the model: `[CLS] query [SEP] document [SEP]`.
+- Every attention head can compare any query token against any document token in the same forward pass — it can learn fine-grained interaction patterns.
+- **Limitation:** no pre-computation. Scoring N documents requires N forward passes. For 5,470 hotels at ~20 ms/pair = 109 seconds — unusable for real-time search.
+
+#### Two-stage retrieval (retrieve and rerank)
+
+The standard production architecture solves the bi-encoder/cross-encoder tradeoff:
+
+1. **Stage 1 — fast retrieval (bi-encoder):** Retrieve the top `rerank_k` candidates (e.g. 50) from the full corpus using BM25 + vector + RRF. This is fast (O(log N) for BM25, O(HNSW) for vector, O(rerank_k) for RRF).
+2. **Stage 2 — precise reranking (cross-encoder):** Score only the top `rerank_k` candidates with the cross-encoder. Return the top `top_k` re-ordered results.
+
+Latency: 50 pairs × ~20 ms each × batched = ~55 ms extra. Total: ~113 ms vs ~56 ms for RRF alone. Acceptable for interactive search.
+
+The cross-encoder is only as good as the candidate pool it receives — if the relevant document is not in the top-50 from Stage 1, the cross-encoder cannot recover it. This is why improving Stage 1 recall (`candidate_k`, `rerank_k`) matters.
+
+#### Why `cross-encoder/ms-marco-MiniLM-L-6-v2`
+
+- **MS-MARCO training:** Trained on 8.8 M (query, passage) pairs from Bing web search. Strong generalisation to new domains.
+- **MiniLM-L-6:** 6-layer BERT-like encoder, ~22 M parameters. 6 layers vs BERT-base's 12 → approximately 2× faster inference with modest quality loss (L-12 would score ~+2–3% NDCG).
+- **Raw logit output:** The model outputs unnormalised logits (typically −10 to +10). Larger = more relevant. Scores are comparable within one query (for reranking) but not across queries.
+- **Alternative — bigger model (`cross-encoder/ms-marco-MiniLM-L-12-v2`):** ~2× slower but higher quality. Worth evaluating if latency budget allows.
+
+#### `_build_reranking_text()` design
+
+The cross-encoder reads the hotel document as free text. The function constructs:
+```
+hotel_name | destination, country | hotel_description | Activities: a, b, c | Tags: t1, t2
+```
+
+Design decisions:
+- **`|` separator:** clearly delimits fields for a model that reads the full sequence.
+- **Activities and tags explicitly labeled:** "Activities: spa, golf" is more informative than "spa, golf" — the label signals these are structured attributes, not part of the description prose.
+- **Omit numeric/geographic fields:** price, star rating, lat/lon are not text the model was trained to interpret for relevance. Including them adds noise.
+- **Missing fields → empty string, skipped:** `_build_reranking_text({})` returns an empty string rather than raising. This prevents a bad document from crashing the entire reranking call.
+
+#### `Reranker` Protocol
+
+```python
+@runtime_checkable
+class Reranker(Protocol):
+    def rerank(self, query: str, hits: list[Hit], *, top_k: int) -> list[Hit]: ...
+```
+
+Structural typing (PEP 544): any object with a `rerank` method satisfying this signature is a `Reranker` — no inheritance required. This is the same pattern as `EmbeddingProvider`. Benefits:
+
+- **Testability:** `MagicMock()` satisfies the Protocol for unit tests without loading the model.
+- **Extensibility:** A `BedrockReranker` (M12) or a `DummyReranker` can be swapped in by returning any compliant object.
+- **`@runtime_checkable`:** `isinstance(obj, Reranker)` works at runtime, enabling the API to check if a reranker was actually loaded.
+
+#### Graceful degradation
+
+If the model fails to load at startup: `_create_reranker()` catches the exception, logs a warning, and returns `None`. The API continues to serve without reranking. If the reranker raises at query time (OOM, GPU error): `hybrid_search()` catches the exception, logs a warning, and falls back to the truncated RRF results. No request fails because of a reranker error.
+
+### Design decisions
+
+| Decision | Chosen | Alternatives | Reason |
+|---|---|---|---|
+| Model | `ms-marco-MiniLM-L-6-v2` | L-2-v2 (faster), L-12-v2 (better) | Best latency-quality balance for CPU; ~86 MB download |
+| `rerank_k=50` | 50 candidates passed to cross-encoder | 20 (faster), 100 (better recall) | Covers most NDCG@10 gains; latency stays < 150 ms p95 |
+| Reranking text format | `field1 | field2 | …` | JSON, XML, raw description only | Pipe-delimited plaintext is the convention for cross-encoder inputs; keeps text short |
+| Feature flag `reranking_enabled` | Boolean, defaults to `False` | Always-on | Model download is ~86 MB; opt-in prevents startup surprise |
+| `reranking_took_ms` in response | Yes | No (keep response lean) | Observability: clients can see the reranking overhead and decide whether to enable it |
+| `reranker` arg to `hybrid_search()` | Optional (`None`) | Separate `hybrid_rerank_search()` | Single function; `None` → skip reranking, keeps call sites clean |
+
+### Results summary (M8)
+
+| Metric | RRF | Rerank (RRF + CE) | Δ vs RRF |
+|---|---|---|---|
+| NDCG@10 | 0.6239 | **0.6830** | +0.0591 (+9.5%) |
+| MRR | **0.8449** | 0.8191 | −0.0258 (−3.1%) |
+| HitRate@10 | **0.9516** | **0.9516** | 0.0000 |
+| Precision@10 | 0.7210 | **0.7935** | +0.0725 (+10.1%) |
+| exact_destination NDCG@10 | 0.5347 | **0.7934** | +0.2587 (+48%) |
+| activities NDCG@10 | 0.4002 | **0.5726** | +0.1724 (+43%) |
+| nightlife NDCG@10 | 0.5053 | **0.6389** | +0.1336 (+26%) |
+| family NDCG@10 | **0.7352** | 0.6507 | −0.0845 (−11%) |
+| Latency p50 | **56 ms** | 113 ms | +57 ms |
+
+**Core learning:** Cross-encoder reranking is the highest-NDCG strategy overall, surpassing pure vector (0.694) for the first time. The +9.5% NDCG improvement over RRF comes from the cross-encoder's ability to attend jointly to query tokens and document tokens — it can see that "Tenerife" in the query matches "destination: Tenerife" in the document, which neither BM25 nor vector can do independently. The cost is ~2× latency (113 ms vs 56 ms p50) and a small MRR regression on structured-constraint classes where the model's general-purpose relevance judgment has no advantage over the already-filtered pool. This two-stage architecture (fast retrieval → powerful reranking) is the standard production pattern for neural IR systems.

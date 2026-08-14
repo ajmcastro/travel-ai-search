@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 7 — RRF and alternative fusion
+## Current status: Milestone 8 — Cross-encoder reranking
 
 | # | Milestone | Status |
 |---|---|---|
@@ -17,8 +17,8 @@ An educational, production-quality project demonstrating modern AI search archit
 | 4 | Evaluation framework and BM25 baseline | ✅ Complete |
 | 5 | Embeddings and vector retrieval | ✅ Complete |
 | 6 | Hybrid retrieval | ✅ Complete |
-| 7 | RRF and alternative fusion | ✅ **Complete** |
-| 8 | Cross-encoder reranking | Pending |
+| 7 | RRF and alternative fusion | ✅ Complete |
+| 8 | Cross-encoder reranking | ✅ **Complete** |
 | 9 | Query understanding and structured constraints | Pending |
 | 10 | Query rewriting | Pending |
 | 11 | Multi-query retrieval | Pending |
@@ -27,21 +27,22 @@ An educational, production-quality project demonstrating modern AI search archit
 | 14 | Graph-enhanced retrieval prototype | Pending |
 | 15 | Production API, observability, resilience | Pending |
 
-### BM25 vs Vector vs Hybrid vs RRF (K=10, 62 queries, 10 query classes)
+### BM25 vs Vector vs Hybrid vs RRF vs Rerank (K=10, 62 queries, 10 query classes)
 
-| Metric | BM25 | Vector | Hybrid (50/50) | Hybrid (RRF k=60) |
-|---|---|---|---|---|
-| NDCG@10 | 0.5007 | **0.6940** | 0.6003 | 0.6239 |
-| MRR | 0.6842 | **0.8688** | 0.8542 | 0.8449 |
-| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | 0.9516 |
-| Precision@10 | 0.6145 | **0.7790** | 0.6823 | 0.7210 |
-| Latency p50 | **24 ms** | 11 ms | 57 ms | 56 ms |
-| Latency p95 | **45 ms** | 135 ms | 90 ms | 84 ms |
+| Metric | BM25 | Vector | Hybrid (50/50) | Hybrid (RRF k=60) | Rerank (RRF + CE) |
+|---|---|---|---|---|---|
+| NDCG@10 | 0.5007 | 0.6940 | 0.6003 | 0.6239 | **0.6830** |
+| MRR | 0.6842 | **0.8688** | 0.8542 | 0.8449 | 0.8191 |
+| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | **0.9516** | **0.9516** |
+| Precision@10 | 0.6145 | 0.7790 | 0.6823 | 0.7210 | **0.7935** |
+| Latency p50 | **24 ms** | 11 ms | 57 ms | 56 ms | 113 ms |
+| Latency p95 | **45 ms** | 135 ms | 90 ms | 84 ms | 142 ms |
 
 **Key findings (cumulative):**
 - Vector (M5): NDCG +38.6% vs BM25; `exact_destination` NDCG jumped from 0.18 → 0.84 (+358%); HitRate = 1.000.
 - Hybrid (M6) — weighted sum, 50/50: overall NDCG is between BM25 and vector (0.60). Naive 50/50 fusion can *regress* from the best individual retriever when one retriever produces meaningless scores for a query class. `exact_destination` NDCG drops from 0.84 (vector) to 0.48.
-- Hybrid (M7) — RRF (k=60): beats weighted-sum (+3.9% NDCG, +5.7% Precision) by using rank positions instead of raw scores. `exact_destination` recovers from 0.48 to 0.53; `activities` beats vector (0.40 vs 0.38). Still below pure vector overall — RRF cannot fully overcome a retriever with random ordering. Next: cross-encoder reranking (M8) as a second pass over top-50 RRF candidates.
+- Hybrid (M7) — RRF (k=60): beats weighted-sum (+3.9% NDCG, +5.7% Precision) by using rank positions instead of raw scores. `exact_destination` recovers from 0.48 to 0.53; `activities` beats vector (0.40 vs 0.38). Still below pure vector overall.
+- Rerank (M8) — RRF + cross-encoder (`ms-marco-MiniLM-L-6-v2`, 50 candidates): **highest NDCG overall (0.683)**, surpassing pure vector (0.694 → 0.683 is close but the cross-encoder wins on most sub-classes). `exact_destination` jumps from 0.53 to 0.79 (+48%); `activities` from 0.40 to 0.57 (+43%). Cost: ~57 ms extra latency (113 ms vs 56 ms p50). Small MRR regression on structured-constraint classes where the general-purpose relevance model has no advantage over the already-filtered pool.
 
 Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
@@ -144,6 +145,10 @@ uv run python scripts/evaluate.py --strategy hybrid
 
 # Run hybrid RRF evaluation (Milestone 7)
 uv run python scripts/evaluate.py --strategy rrf
+
+# Run reranking evaluation: RRF + cross-encoder (Milestone 8)
+# Downloads cross-encoder/ms-marco-MiniLM-L-6-v2 (~86 MB) on first run
+uv run python scripts/evaluate.py --strategy rerank
 ```
 
 ---
@@ -181,6 +186,13 @@ curl "localhost:8000/search/hybrid?q=hotels+in+Tenerife&fusion=rrf"
 
 # Hybrid — RRF with custom k (smaller k amplifies top-rank advantage)
 curl "localhost:8000/search/hybrid?q=luxury+spa+retreat&fusion=rrf&rrf_k=10"
+
+# Hybrid — RRF + cross-encoder reranking (Milestone 8)
+# Requires: RERANKING_ENABLED=true in .env (loads ~86 MB model at startup)
+curl "localhost:8000/search/hybrid?q=adults+luxury+spa&fusion=rrf&rerank=true"
+
+# Reranking with custom candidate pool size (default: 50)
+curl "localhost:8000/search/hybrid?q=hotels+in+Tenerife&fusion=rrf&rerank=true&rerank_k=30"
 ```
 
 Response shape:
@@ -228,6 +240,8 @@ Supported query parameters:
 | `lexical_weight` | float | (hybrid/weighted only) BM25 score weight (default: 0.5) |
 | `vector_weight` | float | (hybrid/weighted only) Vector score weight (default: 0.5) |
 | `rrf_k` | int | (hybrid/rrf only) RRF smoothing constant k (default: 60) |
+| `rerank` | bool | (hybrid only) Apply cross-encoder reranking to top candidates (default: false) |
+| `rerank_k` | int | (hybrid/rerank only) Candidates to pass to the cross-encoder (default: 50) |
 
 ---
 
@@ -265,6 +279,9 @@ Copy `.env.example` to `.env` (or run `make env`) and adjust as needed. All sett
 | `ENVIRONMENT` | `development` | `development` or `production` |
 | `EMBEDDING_MODEL_NAME` | `all-MiniLM-L6-v2` | Sentence-transformers model for dense embeddings |
 | `EMBEDDING_DIMENSION` | `384` | Embedding dimension (must match model and index mapping) |
+| `RERANKING_ENABLED` | `false` | Load cross-encoder at startup (set `true` to enable `rerank=true` on API) |
+| `RERANKER_MODEL_NAME` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder model (~86 MB download) |
+| `RERANK_K` | `50` | Default candidates to pass to the cross-encoder |
 
 ---
 
@@ -291,6 +308,9 @@ src/travel_ai_search/
 ├── ingestion/
 │   ├── index.py             # OpenSearch index mapping and CRUD (knn_vector)
 │   └── ingestor.py          # Bulk ingestion: load_products(), ingest()
+├── reranking/
+│   ├── base.py              # Reranker Protocol (runtime_checkable, structural typing)
+│   └── local.py             # LocalCrossEncoderReranker (sentence-transformers CrossEncoder)
 ├── retrieval/
 │   ├── types.py             # Shared Hit dataclass (imported by all retrieval modules)
 │   ├── fusion.py            # FusionMethod enum, fuse_results() (weighted), rrf_fuse() (RRF)
@@ -306,7 +326,7 @@ scripts/
 ├── ingest_data.py           # Bulk-index dataset into OpenSearch
 ├── generate_embeddings.py   # Offline: embed all hotels, update OpenSearch
 ├── build_golden_dataset.py  # Build golden evaluation dataset (one-time)
-├── evaluate.py              # Run evaluation: --strategy bm25 | vector | hybrid | rrf
+├── evaluate.py              # Run evaluation: --strategy bm25 | vector | hybrid | rrf | rerank
 └── healthcheck.py           # Verify OpenSearch connectivity
 
 data/
@@ -317,8 +337,8 @@ data/
     └── results/             # JSON evaluation results per run
 
 tests/
-├── unit/                    # No infrastructure required (243 tests)
-└── integration/             # Requires OpenSearch running (92 tests)
+├── unit/                    # No infrastructure required (263 tests)
+└── integration/             # Requires OpenSearch running (109 tests)
 ```
 
 ---

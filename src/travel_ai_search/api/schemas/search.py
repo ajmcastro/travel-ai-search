@@ -95,14 +95,17 @@ class HybridSearchResponse(BaseModel):
     """Response schema for the hybrid (BM25 + vector) search endpoint.
 
     Includes per-stage timing so callers can see the breakdown between
-    the lexical query, the vector query, and client-side fusion overhead.
+    the lexical query, the vector query, fusion overhead, and optional
+    cross-encoder reranking.  reranking_took_ms is 0 when reranking was
+    not applied.
     """
 
     hits: list[SearchHit]
     total: int  # unique candidates in the fusion pool
-    took_ms: int  # total wall-clock time (both queries + fusion)
+    took_ms: int  # total wall-clock time (both queries + fusion + reranking)
     lexical_took_ms: int
     vector_took_ms: int
+    reranking_took_ms: int = 0
 
     @classmethod
     def from_result(cls, result: HybridSearchResult) -> HybridSearchResponse:
@@ -116,4 +119,5 @@ class HybridSearchResponse(BaseModel):
             took_ms=result.took_ms,
             lexical_took_ms=result.lexical_took_ms,
             vector_took_ms=result.vector_took_ms,
+            reranking_took_ms=result.reranking_took_ms,
         )

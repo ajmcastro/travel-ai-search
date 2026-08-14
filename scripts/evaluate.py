@@ -5,6 +5,7 @@ Usage:
     uv run python scripts/evaluate.py --strategy vector    # Vector ANN
     uv run python scripts/evaluate.py --strategy hybrid    # Hybrid weighted-sum
     uv run python scripts/evaluate.py --strategy rrf       # Hybrid RRF
+    uv run python scripts/evaluate.py --strategy rerank    # RRF + cross-encoder reranking
     uv run python scripts/evaluate.py --strategy bm25
     uv run python scripts/evaluate.py --k 10 --no-save     # skip JSON output
     uv run python scripts/evaluate.py --golden data/evaluation/golden_queries.jsonl
@@ -129,11 +130,48 @@ def make_rrf_fn(
     return search
 
 
+def make_rerank_fn(
+    client: Any,
+    index: str,
+    embedding_provider: Any = None,
+    rrf_k: int = 60,
+    candidate_k: int = 50,
+    rerank_k: int = 50,
+    reranker_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    **_: Any,
+) -> Any:
+    """Return a SearchFn that uses RRF fusion followed by cross-encoder reranking.
+
+    Stage 1: BM25 + vector → RRF fusion → top rerank_k candidates.
+    Stage 2: Cross-encoder scores each (query, candidate) pair → top_k returned.
+    """
+    from travel_ai_search.reranking.local import LocalCrossEncoderReranker
+
+    provider = embedding_provider
+    reranker = LocalCrossEncoderReranker(reranker_model_name)
+
+    def search(query_text: str, top_k: int, filters: dict[str, Any]) -> list[str]:
+        params = HybridSearchParams(
+            query=query_text,
+            top_k=top_k,
+            candidate_k=candidate_k,
+            fusion=FusionMethod.rrf,
+            rrf_k=rrf_k,
+            rerank_k=max(top_k, rerank_k),
+            **filters,
+        )
+        result = hybrid_search(client, provider, params, index=index, reranker=reranker)
+        return [hit.id for hit in result.hits]
+
+    return search
+
+
 STRATEGIES: dict[str, Any] = {
     "bm25": make_bm25_fn,
     "vector": make_vector_fn,
     "hybrid": make_hybrid_fn,
     "rrf": make_rrf_fn,
+    "rerank": make_rerank_fn,
 }
 
 
@@ -255,7 +293,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # Load embedding model if needed
     embedding_provider = None
-    if args.strategy in ("vector", "hybrid", "rrf"):
+    if args.strategy in ("vector", "hybrid", "rrf", "rerank"):
         print(f"\nLoading embedding model '{settings.embedding_model_name}' …")
         embedding_provider = LocalEmbeddingProvider(settings.embedding_model_name)
         print(f"  dimension={embedding_provider.dimension}")

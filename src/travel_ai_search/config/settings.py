@@ -49,6 +49,18 @@ class Settings(BaseSettings):
     hybrid_fusion: str = "weighted"
     rrf_k: int = 60
 
+    # Reranking (Milestone 8)
+    # reranking_enabled: set True to load the cross-encoder at startup.
+    #   When False, the reranker is never loaded and reranking is a no-op
+    #   even if rerank=true is passed to the API endpoint.
+    # reranker_model_name: any cross-encoder model from HuggingFace Hub.
+    #   Smaller/faster: cross-encoder/ms-marco-MiniLM-L-2-v2
+    #   Larger/better:  cross-encoder/ms-marco-MiniLM-L-12-v2
+    # rerank_k: candidates passed to the cross-encoder (must be ≥ top_k).
+    reranking_enabled: bool = False
+    reranker_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_k: int = 50
+
 
 @lru_cache
 def get_settings() -> Settings:
