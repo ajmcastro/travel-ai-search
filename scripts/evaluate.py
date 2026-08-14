@@ -8,6 +8,7 @@ Usage:
     uv run python scripts/evaluate.py --strategy rerank    # RRF + cross-encoder reranking
     uv run python scripts/evaluate.py --strategy understand # QU (M9)
     uv run python scripts/evaluate.py --strategy rewrite   # QU + query rewriting (M10)
+    uv run python scripts/evaluate.py --strategy expand    # QU + multi-query expansion (M11)
     uv run python scripts/evaluate.py --strategy bm25
     uv run python scripts/evaluate.py --k 10 --no-save     # skip JSON output
     uv run python scripts/evaluate.py --golden data/evaluation/golden_queries.jsonl
@@ -248,6 +249,50 @@ def make_rewrite_fn(
     return search
 
 
+def make_expand_fn(
+    client: Any,
+    index: str,
+    embedding_provider: Any = None,
+    rrf_k: int = 60,
+    candidate_k: int = 50,
+    n_queries: int = 3,
+    **_: Any,
+) -> Any:
+    """Return a SearchFn that uses QU + multi-query expansion + RRF fusion.
+
+    Like 'understand', extracts hard constraints from query_text and ignores
+    ground-truth filters.  In addition, generates n_queries variant queries via
+    LocalQueryExpander and retrieves independently for each variant.  All 2×N
+    rank lists are fused via RRF, giving broader recall than single-query hybrid.
+
+    This establishes the expansion pipeline baseline.  A real LLM expander
+    (Milestone 12+) would generate more semantically diverse variants.
+    """
+    from travel_ai_search.query_understanding.expander import LocalQueryExpander
+    from travel_ai_search.query_understanding.extractor import RuleBasedQueryUnderstandingEngine
+    from travel_ai_search.retrieval.multi_query import multi_query_search
+
+    provider = embedding_provider
+    engine = RuleBasedQueryUnderstandingEngine()
+    expander = LocalQueryExpander()
+
+    def search(query_text: str, top_k: int, filters: dict[str, Any]) -> list[str]:
+        qu = engine.understand(query_text)
+        expanded = expander.expand(qu.semantic_query, n_queries)
+        params = HybridSearchParams(
+            query=qu.semantic_query,
+            top_k=top_k,
+            candidate_k=candidate_k,
+            fusion=FusionMethod.rrf,
+            rrf_k=rrf_k,
+            **qu.to_search_filters(),
+        )
+        result = multi_query_search(client, provider, params, expanded, index=index)
+        return [hit.id for hit in result.hits]
+
+    return search
+
+
 STRATEGIES: dict[str, Any] = {
     "bm25": make_bm25_fn,
     "vector": make_vector_fn,
@@ -256,6 +301,7 @@ STRATEGIES: dict[str, Any] = {
     "rerank": make_rerank_fn,
     "understand": make_understand_fn,
     "rewrite": make_rewrite_fn,
+    "expand": make_expand_fn,
 }
 
 
@@ -377,7 +423,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # Load embedding model if needed
     embedding_provider = None
-    if args.strategy in ("vector", "hybrid", "rrf", "rerank", "understand", "rewrite"):
+    if args.strategy in ("vector", "hybrid", "rrf", "rerank", "understand", "rewrite", "expand"):
         print(f"\nLoading embedding model '{settings.embedding_model_name}' …")
         embedding_provider = LocalEmbeddingProvider(settings.embedding_model_name)
         print(f"  dimension={embedding_provider.dimension}")

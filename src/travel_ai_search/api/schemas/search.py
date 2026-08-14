@@ -141,6 +141,8 @@ class FullSearchRequest(BaseModel):
     rerank: bool = False
     rerank_k: int | None = None
     rewrite: bool = False
+    expand: bool = False
+    n_queries: int = 3
 
 
 class FullSearchResponse(BaseModel):
@@ -154,6 +156,7 @@ class FullSearchResponse(BaseModel):
     reranking_took_ms: int = 0
     query_understanding: QueryUnderstandResponse
     rewritten_query: str | None = None
+    expanded_queries: list[str] | None = None
 
     @classmethod
     def from_result(
@@ -162,6 +165,7 @@ class FullSearchResponse(BaseModel):
         qu_response: QueryUnderstandResponse,
         *,
         rewritten_query: str | None = None,
+        expanded_queries: list[str] | None = None,
     ) -> FullSearchResponse:
         hits = [
             SearchHit.model_validate({"id": hit.id, "score": hit.score, **hit.source})
@@ -176,4 +180,5 @@ class FullSearchResponse(BaseModel):
             reranking_took_ms=result.reranking_took_ms,
             query_understanding=qu_response,
             rewritten_query=rewritten_query,
+            expanded_queries=expanded_queries,
         )

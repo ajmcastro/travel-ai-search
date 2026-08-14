@@ -8,6 +8,7 @@ from opensearchpy import OpenSearch
 from travel_ai_search.api.deps import (
     get_embedding_provider,
     get_os_client,
+    get_query_expander,
     get_query_rewriter,
     get_query_understanding_engine,
     get_reranker,
@@ -24,11 +25,13 @@ from travel_ai_search.api.schemas.search import (
 from travel_ai_search.config.settings import Settings
 from travel_ai_search.embeddings.base import EmbeddingProvider
 from travel_ai_search.query_understanding.base import QueryUnderstandingEngine
+from travel_ai_search.query_understanding.expander import QueryExpander
 from travel_ai_search.query_understanding.rewriter import QueryRewriter
 from travel_ai_search.reranking.base import Reranker
 from travel_ai_search.retrieval.fusion import FusionMethod
 from travel_ai_search.retrieval.hybrid import HybridSearchParams, hybrid_search
 from travel_ai_search.retrieval.lexical import LexicalSearchParams, lexical_search
+from travel_ai_search.retrieval.multi_query import multi_query_search
 from travel_ai_search.retrieval.vector import VectorSearchParams, vector_search
 
 router = APIRouter(tags=["Search"])
@@ -202,9 +205,10 @@ def full_search_endpoint(
     loaded_reranker: Reranker | None = Depends(get_reranker),
     qu_engine: QueryUnderstandingEngine = Depends(get_query_understanding_engine),
     query_rewriter: QueryRewriter | None = Depends(get_query_rewriter),
+    query_expander: QueryExpander | None = Depends(get_query_expander),
     settings: Settings = Depends(get_settings),
 ) -> FullSearchResponse:
-    """Full orchestrated search pipeline: QU → optional rewriting → hybrid RRF → optional reranking.
+    """Full orchestrated search pipeline: QU → optional rewriting → optional expansion → retrieval.
 
     The query is parsed by the rule-based query understanding engine, which extracts
     hard constraints (month, departure airport, max price, star rating, family/adults
@@ -212,16 +216,22 @@ def full_search_endpoint(
 
     When rewrite=true and a query rewriter is configured (query_rewriting_enabled=true),
     the semantic query is expanded or paraphrased by the LLM provider before retrieval.
-    Both the original semantic query and the rewritten form are returned in the response
-    for observability.  Rewriting failures fall back to the original semantic query.
+
+    When expand=true and a query expander is configured (query_expansion_enabled=true),
+    n_queries variant queries are generated from the retrieval query and retrieved
+    independently.  All rank lists are fused via RRF, giving broader candidate recall
+    than a single-query hybrid search.  Both rewrite and expand may be combined: the
+    rewritten query is expanded, not the raw semantic query.
+
+    expanded_queries in the response lists the variants used for observability.
 
     Example:
         POST /search
         {"query": "family beach holiday in Greece July from Manchester under £2000"}
 
-    Example (with rewriting):
+    Example (with expansion):
         POST /search
-        {"query": "something quiet with a pool", "rewrite": true}
+        {"query": "quiet luxury spa retreat", "expand": true, "n_queries": 3}
     """
     qu = qu_engine.understand(body.query)
     qu_response = QueryUnderstandResponse.from_understanding(qu)
@@ -246,11 +256,32 @@ def full_search_endpoint(
         **qu.to_search_filters(),
     )
     active_reranker = loaded_reranker if body.rerank else None
-    result = hybrid_search(
-        client,
-        provider,
-        params,
-        index=settings.opensearch_index_name,
-        reranker=active_reranker,
+
+    # Optional multi-query expansion: generate N variants and fuse all rank lists.
+    expanded_queries: list[str] | None = None
+    if body.expand and query_expander is not None:
+        n_queries = max(1, body.n_queries)
+        expanded_queries = query_expander.expand(retrieval_query, n_queries)
+        result = multi_query_search(
+            client,
+            provider,
+            params,
+            expanded_queries,
+            index=settings.opensearch_index_name,
+            reranker=active_reranker,
+        )
+    else:
+        result = hybrid_search(
+            client,
+            provider,
+            params,
+            index=settings.opensearch_index_name,
+            reranker=active_reranker,
+        )
+
+    return FullSearchResponse.from_result(
+        result,
+        qu_response,
+        rewritten_query=rewritten_query,
+        expanded_queries=expanded_queries,
     )
-    return FullSearchResponse.from_result(result, qu_response, rewritten_query=rewritten_query)

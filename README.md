@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 10 — Query rewriting
+## Current status: Milestone 11 — Multi-query retrieval
 
 | # | Milestone | Status |
 |---|---|---|
@@ -20,23 +20,23 @@ An educational, production-quality project demonstrating modern AI search archit
 | 7 | RRF and alternative fusion | ✅ Complete |
 | 8 | Cross-encoder reranking | ✅ Complete |
 | 9 | Query understanding and structured constraints | ✅ Complete |
-| 10 | Query rewriting | ✅ **Complete** |
-| 11 | Multi-query retrieval | Pending |
+| 10 | Query rewriting | ✅ Complete |
+| 11 | Multi-query retrieval | ✅ **Complete** |
 | 12 | AWS Bedrock providers | Pending |
 | 13 | RAG / travel knowledge base | Pending |
 | 14 | Graph-enhanced retrieval prototype | Pending |
 | 15 | Production API, observability, resilience | Pending |
 
-### BM25 vs Vector vs Hybrid vs RRF vs Rerank vs Understand vs Rewrite (K=10, 62 queries, 10 query classes)
+### BM25 vs Vector vs Hybrid vs RRF vs Rerank vs Understand vs Rewrite vs Expand (K=10, 62 queries, 10 query classes)
 
-| Metric | BM25 | Vector | Hybrid (50/50) | RRF | Rerank | Understand | Rewrite |
-|---|---|---|---|---|---|---|---|
-| NDCG@10 | 0.5007 | 0.6940 | 0.6003 | 0.6239 | **0.6830** | 0.6312 | 0.6130 |
-| MRR | 0.6842 | 0.8688 | 0.8542 | 0.8449 | 0.8191 | **0.8620** | 0.8226 |
-| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | 0.9516 | 0.9516 | 0.9355 | **0.9677** |
-| Precision@10 | 0.6145 | 0.7790 | 0.6823 | 0.7210 | **0.7935** | 0.7290 | 0.7242 |
-| Latency p50 | 24 ms | 11 ms | 57 ms | 56 ms | 113 ms | **45 ms** | 54 ms |
-| Latency p95 | 45 ms | 135 ms | 90 ms | 84 ms | 142 ms | **71 ms** | 98 ms |
+| Metric | BM25 | Vector | Hybrid | RRF | Rerank | Understand | Rewrite | **Expand** |
+|---|---|---|---|---|---|---|---|---|
+| NDCG@10 | 0.5007 | 0.6940 | 0.6003 | 0.6239 | **0.6830** | 0.6312 | 0.6130 | 0.6285 |
+| MRR | 0.6842 | 0.8688 | 0.8542 | 0.8449 | 0.8191 | **0.8620** | 0.8226 | 0.8308 |
+| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | 0.9516 | 0.9516 | 0.9355 | **0.9677** | 0.9516 |
+| Precision@10 | 0.6145 | 0.7790 | 0.6823 | 0.7210 | **0.7935** | 0.7290 | 0.7242 | 0.7226 |
+| Latency p50 | 24 ms | 11 ms | 57 ms | 56 ms | 113 ms | **45 ms** | 54 ms | 180 ms |
+| Latency p95 | 45 ms | 135 ms | 90 ms | 84 ms | 142 ms | **71 ms** | 98 ms | 236 ms |
 
 **Key findings (cumulative):**
 - Vector (M5): NDCG +38.6% vs BM25; `exact_destination` NDCG jumped from 0.18 → 0.84 (+358%); HitRate = 1.000.
@@ -45,6 +45,7 @@ An educational, production-quality project demonstrating modern AI search archit
 - Rerank (M8) — RRF + cross-encoder (`ms-marco-MiniLM-L-6-v2`, 50 candidates): **highest NDCG overall (0.683)**. `exact_destination` jumps from 0.53 to 0.79 (+48%); `activities` from 0.40 to 0.57 (+43%). Cost: ~57 ms extra latency.
 - Understand (M9) — rule-based QU + RRF: beats RRF on NDCG (+1.2%) and MRR (+2.0%) while being **20% faster** (45 ms vs 56 ms p50). `adults_couples` NDCG +8.9% (correct `adults_only` filter extracted). Main failure: false-positive constraints on `budget` queries (−18.4%).
 - Rewrite (M10) — QU + `LocalLLMProvider` keyword expansion + RRF: **HitRate improves +3.4%** (more relevant hotels in top-10) but NDCG and MRR regress vs Understand (−2.9%, −4.6%). Classic precision-recall tradeoff: naive synonym expansion broadens recall but dilutes the ranking signal. `activities` class +14.4%. Architecture ready for real LLM (M12).
+- Expand (M11) — QU + `LocalQueryExpander` (N=3 variants) + 6-list RRF: beats rewrite on NDCG (0.629 vs 0.613) because the original query is preserved as the first variant. `activities` +20.9%, `budget` +21.1% (vocabulary mismatch classes benefit most). Cost: 4× latency (180 ms) due to sequential retrieval. `adults_couples` −16.8% (hard constraint filtering is more effective than expansion for this class). Architecture in place for LLM-generated diverse expansion variants (M12).
 
 Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 

@@ -523,3 +523,72 @@ Results are also saved as machine-readable JSON under `data/evaluation/results/`
 - M12 (Bedrock): replacing LocalLLMProvider with Claude Sonnet should produce targeted, context-aware rewrites that improve NDCG without the recall-precision tradeoff.
 - Can confidence-weighted rewriting (partially blend original and rewritten embeddings) balance precision and recall?
 - Expansion for the nightlife class clearly needs a different term set — custom domain-specific expansion tables per query class?
+
+---
+
+### [Milestone 11] Multi-query expansion vs single-query strategies
+
+**Date:** 2026-08-14
+**Hypothesis:** Generating N variant queries from a single semantic query and retrieving independently for each, then fusing all 2N rank lists via RRF, will improve HitRate@10 and recall over single-query hybrid retrieval. The cost will be N× latency. NDCG and MRR may regress slightly if the added variants introduce noise.
+
+**Configuration:**
+- index: `travel_hotels` (5,470 hotels, lucene/HNSW, cosinesimil)
+- embedding model: `all-MiniLM-L6-v2` (384d, L2-normalised)
+- fusion: RRF, `k=60`
+- `candidate_k=50` per retriever, per query (N=3 queries → 6 lists, each ≤ 50 hits → ≤ 300 candidates before deduplication)
+- `n_queries=3`: original + synonym substitution variant + context elaboration variant
+- expander: `LocalQueryExpander` (deterministic, rule-based; no API key)
+- strategy: `expand` — QU → LocalQueryExpander → N×(BM25+vector) → rrf_fuse(2N lists) → top 10
+- golden dataset: 62 queries, 10 classes, 48,675 judgments
+- results file: `data/evaluation/results/expand_2026-08-14.json`
+
+**Results (Understand vs Rewrite vs Expand @ K=10, 62 queries):**
+
+| Metric | Understand | Rewrite | **Expand** | Δ Expand vs Understand |
+|---|---|---|---|---|
+| NDCG@10 | **0.6312** | 0.6130 | 0.6285 | −0.0027 (−0.4%) |
+| MRR | **0.8620** | 0.8226 | 0.8308 | −0.0312 (−3.6%) |
+| HitRate@10 | 0.9355 | **0.9677** | 0.9516 | +0.0161 (+1.7%) |
+| Precision@10 | **0.7290** | 0.7242 | 0.7226 | −0.0064 (−0.9%) |
+| Latency p50 | **45 ms** | 54 ms | 180 ms | +135 ms (+300%) |
+| Latency p95 | **57 ms** | 68 ms | 236 ms | +179 ms |
+
+**Query-class breakdown (Understand vs Expand):**
+
+| Class | n | Understand NDCG | Expand NDCG | Δ | Winner |
+|---|---|---|---|---|---|
+| activities | 6 | 0.4002 | **0.4840** | +0.0838 (+20.9%) | Expand |
+| adults_couples | 6 | **0.9721** | 0.8085 | −0.1636 (−16.8%) | Understand |
+| budget | 5 | 0.3445 | **0.4171** | +0.0726 (+21.1%) | Expand |
+| exact_destination | 10 | **0.7069** | 0.6290 | −0.0779 (−11.0%) | Understand |
+| family | 9 | 0.6900 | **0.7259** | +0.0359 (+5.2%) | Expand |
+| luxury | 6 | **0.7188** | 0.6545 | −0.0643 (−8.9%) | Understand |
+| multi_constraint | 6 | **0.7627** | 0.7685 | +0.0058 (+0.8%) | Expand |
+| natural_language | 4 | 0.5562 | **0.5538** | −0.0024 (−0.4%) | Tie |
+| nightlife | 5 | 0.4981 | **0.4193** | −0.0788 (−15.8%) | Understand |
+| quiet_peaceful | 5 | **0.7095** | 0.6911 | −0.0184 (−2.6%) | Understand |
+
+**Surprises / observations:**
+
+1. **HitRate@10 improves (+1.7%, 0.9355 → 0.9516) but less than rewrite (+3.4%).** Expanding to 3 variants still misses some queries that rewriting catches. This suggests the synonym substitution and context elaboration variants don't always cover the vocabulary gap as effectively as the targeted synonym expansion in LocalLLMProvider. The two approaches are complementary rather than one dominating.
+
+2. **NDCG and MRR regress slightly vs understand (−0.4%, −3.6%).** More surprising is that expansion performs *better* than rewrite on NDCG (0.6285 vs 0.6130), despite higher latency. The reason: multi-query expansion keeps the original query as the first variant, preserving its precision, while the rewrite replaces the original. When the synonym variant or context variant are noisy, the original still contributes its clean signal to RRF.
+
+3. **activities and budget classes: large improvements (+20.9%, +21.1%).** These are the classes where vocabulary mismatch between users and hotel descriptions is most severe. "watersports", "jet skiing", "water activities" — activities descriptions use varied terms that the original query misses. Multiple variants increase coverage. Budget queries benefit similarly: the context elaboration ("offering value for money with good facilities") aligns with how budget hotels describe themselves.
+
+4. **adults_couples regression (−16.8%).** This is the most surprising finding. Understand extracts `adults_only=True` as a hard filter and retrieves 100% precision results. Expansion generates a synonym variant ("adults-only retreat...") and a context variant (both still correct) but the extra variants retrieve some couples-focused hotels without the `adults_only` flag, reducing precision. The QU-extracted hard filter is more effective here than vocabulary expansion.
+
+5. **exact_destination regression (−11.0%).** For queries like "hotels in Tenerife", QU extracts `country=Spain` as a hard filter and the semantic query is clean. Expansion adds context elaboration ("beach resort accommodation") that may pull in non-destination-specific hotels from Spain that happen to match the context terms but not the intended destination.
+
+6. **Latency is 4× slower (180 ms vs 45 ms).** N=3 queries × 2 retrievals = 6 sequential OpenSearch requests. Single-query hybrid is 2 requests. This is the fundamental cost of ensemble retrieval. Production systems would parallelize the N retrievals to reduce wall-clock time to max(N retrieval latencies) ≈ single-query latency + fusion overhead. Parallelization would require `asyncio.gather()` or a thread pool, which is out of scope for this educational implementation.
+
+7. **Multi-query retains full filter precision.** All HybridSearchParams filter fields (country, family_friendly, etc.) are applied identically to every per-query retrieval. Filters remain hard constraints — no multi-query variant can bypass them.
+
+8. **RRF naturally handles duplicate results across variants.** If both the synonym variant and context variant retrieve the same hotel, its RRF score accumulates contributions from both rank positions, correctly boosting it. No explicit deduplication is needed.
+
+**Key finding:** Multi-query expansion with `LocalQueryExpander` shows the expected ensemble pattern: +1.7% HitRate but −0.4% NDCG vs understand. It is more precise than rewrite (keeps the original query signal) but less effective at recall than a well-targeted LLM rewrite. The 4× latency cost is the primary barrier to production use in this sequential implementation. A real LLM expander (M12+) would generate semantically diverse variants — not just synonym substitutions — which would improve recall without vocabulary-mismatch noise. The architecture (QueryExpander Protocol → multi_query_search → rrf_fuse) is in place for that upgrade.
+
+**Next question this raises:**
+- M12 (Bedrock): an LLM-generated expansion set would produce variants like "quiet Mediterranean family resort", "peaceful child-friendly beach destination southern Europe", "family coastal resort away from nightlife" — semantically diverse rather than word-substitution based. Would this close the gap with understand on precision while improving recall?
+- Can parallel retrieval (asyncio or threads) make multi-query latency competitive with single-query?
+- Is there a per-class routing heuristic — use single-query for `exact_destination`/`adults_couples` (where hard filters dominate), multi-query for `activities`/`budget` (where vocabulary mismatch is the main failure mode)?

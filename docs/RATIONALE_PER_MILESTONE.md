@@ -1226,3 +1226,111 @@ A deterministic, zero-dependency stub that looks up known travel keywords and ap
 | Latency p50 | **45 ms** | 54 ms | +9 ms |
 
 **Core learning:** Naive keyword expansion demonstrates the classic IR expansion tradeoff — higher recall (HitRate) at the cost of ranking precision (NDCG, MRR). The recall gain comes from added synonyms matching more hotel descriptions; the precision loss comes from embedding centroid drift when synonyms are added indiscriminately. This validates the need for a real LLM (M12) that can produce targeted, context-aware rewrites rather than broad synonym lists. The `LLMProvider` protocol ensures BedrockLLMProvider can be substituted in M12 without touching routes, retrieval, or evaluation code.
+
+---
+
+## Milestone 11 — Multi-query retrieval
+
+### What we added
+
+An optional **multi-query expansion** stage that runs between query understanding and retrieval. Instead of a single retrieval pass, the semantic query is expanded into N variants; each variant is retrieved independently, and all 2N rank lists are fused via RRF.
+
+**New modules:**
+- `src/travel_ai_search/query_understanding/expander.py` — `QueryExpander` Protocol, `IdentityQueryExpander` (stub), `LocalQueryExpander` (deterministic rule-based expander)
+- `src/travel_ai_search/retrieval/multi_query.py` — `multi_query_search()`: runs N×(BM25+vector) and fuses all rank lists with `rrf_fuse()`
+
+**Pipeline change (POST /search with `expand=true`):**
+```
+user query
+  → QueryUnderstandingEngine  [as before]
+       ↓ semantic_query + hard constraints
+  → [optional] QueryRewriter  [as before, can be combined with expansion]
+       ↓ retrieval_query
+  → QueryExpander (NEW)  — generate N query variants
+       ↓ [variant₁, variant₂, …, variantₙ]
+  → N × (BM25 + vector ANN)  [each variant runs independently with same filters]
+       ↓ 2N ranked lists
+  → rrf_fuse([lex₁, vec₁, lex₂, vec₂, …])  [existing function; no interface change]
+       ↓ fused top-k candidates
+  → [optional] cross-encoder reranking (on params.query, not variants)
+```
+
+**New API fields:**
+- `FullSearchRequest.expand: bool = False` — opt-in expansion per request
+- `FullSearchRequest.n_queries: int = 3` — number of variants to generate
+- `FullSearchResponse.expanded_queries: list[str] | None` — variant queries used (for observability)
+
+**Settings:**
+- `query_expansion_enabled: bool = False` — controls whether a `LocalQueryExpander` is created at startup
+- `num_expansion_queries: int = 3` — default number of query variants
+
+### IR concepts
+
+#### Multi-query retrieval (ensemble retrieval)
+
+Single-query retrieval is sensitive to the specific words in the query. BM25 can only match terms that appear in both query and document. Dense vector search embeds the query to a single centroid — nearby vectors in embedding space get high scores, but documents that describe the same concept with different vocabulary may be geometrically distant.
+
+Multi-query retrieval addresses this by running N independent retrievals, one per query variant, and taking the union of all candidates. The union has strictly better recall than any single query alone: a document missed by variant₁ may be found by variant₂.
+
+**Analogy:** an ensemble classifier outperforms a single classifier by averaging over diverse hypotheses. Here, diverse query phrasings are the "hypotheses"; their candidate sets are the "predictions".
+
+#### Variant generation strategies
+
+`LocalQueryExpander` generates three kinds of variants:
+
+1. **Original query** (always first): preserves the baseline retrieval signal. Including the original ensures multi-query retrieval is never *worse* than single-query at the limit.
+2. **Synonym substitution variant**: replaces words word-by-word from a travel-domain synonym table (e.g., "beach" → "coastal", "luxury" → "premium"). Produces different BM25 term matches without changing the meaning.
+3. **Context elaboration variant**: appends a descriptive phrase targeting hotel description vocabulary (e.g., "quiet resort" → "quiet resort in a peaceful setting away from nightlife"). Makes the query embedding closer to how hotels describe the relevant amenities.
+
+The key design constraint: **the first element must always be the original query**. This guarantees that the multi-query path subsumes the single-query result — if all other variants are noisy, the original still contributes its signal to RRF.
+
+#### RRF as the natural fusion method for N lists
+
+Weighted-sum normalisation requires exactly two lists (it normalises each independently; N-list extension requires a normalisation scheme and weight-per-list). RRF naturally handles any number of lists: for each document, sum `1/(k + rank_r)` over all lists r. Documents that appear consistently across multiple variants accumulate higher scores; documents retrieved by only one variant get a smaller contribution.
+
+This is why `rrf_fuse()` was designed with a variadic `list[list[Hit]]` signature in M7: going from 2 lists (single-query hybrid) to 2N lists (multi-query) requires no interface change.
+
+#### Multi-query vs query rewriting
+
+| Aspect | Rewriting (M10) | Multi-query (M11) |
+|---|---|---|
+| Number of retrieval passes | 1 (one alternative query replaces the original) | N (N variants retrieved independently) |
+| Original query preserved | No — the rewritten query replaces the original | Yes — always first variant |
+| Recall mechanism | Richer single query → better embedding coverage | Union of N candidate sets → broader coverage |
+| Latency cost | ~0 ms (LocalLLMProvider) + 1 embedding call | N× embedding + retrieval calls |
+| Combination in RRF | 2 lists (BM25 + vector of rewritten query) | 2N lists |
+| Best case | Vocabulary bridging (rewrite targets doc vocabulary) | Coverage (each variant captures a different document subset) |
+| Worst case | Centroid drift (synonym noise degrades vector precision) | Noise accumulation (bad variants dilute the fused ranking) |
+
+**Combining rewrite + expand:** the route supports both simultaneously. When `rewrite=True` and `expand=True`, the rewritten query is expanded (not the raw semantic query). This gives the LLM rewriter the first pass to clean up vocabulary, then the expander generates variants from the improved query.
+
+#### Latency cost and production mitigation
+
+For N=3 queries: 3 BM25 + 3 vector = 6 sequential OpenSearch requests. Single-query hybrid is 2 requests. This educational implementation is sequential for simplicity. A production system would parallelize the N retrieval pairs with `asyncio.gather()`, reducing wall-clock time to approximately `max(N retrieval latencies) + fusion` ≈ single-query latency + ~1 ms fusion overhead.
+
+### Key design decisions
+
+| Decision | Chosen | Alternatives | Reason |
+|---|---|---|---|
+| `QueryExpander` Protocol | `@runtime_checkable` structural typing | ABC inheritance | Same pattern as EmbeddingProvider, Reranker, QueryUnderstandingEngine; no inheritance; MagicMock satisfies it |
+| First variant = original query | Always | First = best LLM variant | Guarantees multi-query ≥ single-query recall; original is the highest-confidence query |
+| Always use RRF in multi_query_search | Ignore `params.fusion` (which may be `weighted`) | Respect fusion param | Weighted-sum doesn't extend to N lists without additional weight-per-list design; RRF is natural |
+| Reranking query = `params.query` (original) | Rerank on original, not any variant | Rerank on best variant | Reranker scores (query, document) relevance; the user's original intent is the ground truth |
+| `expand_enabled: bool = False` | Disabled by default | Enabled | N× latency is the default with sequential implementation; user opts in knowingly |
+| HybridSearchResult reused | Same return type as hybrid_search() | New MultiQuerySearchResult | Routes, schemas, and evaluation code already handle HybridSearchResult; no duplication |
+| `lexical_took_ms` = sum of N BM25 times | Accumulate | Report only first | Transparency: total time helps the user understand the N× cost |
+
+### Results summary (M11)
+
+| Metric | Understand | Rewrite | **Expand** | Δ Expand vs Understand |
+|---|---|---|---|---|
+| NDCG@10 | **0.6312** | 0.6130 | 0.6285 | −0.0027 (−0.4%) |
+| MRR | **0.8620** | 0.8226 | 0.8308 | −0.0312 (−3.6%) |
+| HitRate@10 | 0.9355 | **0.9677** | 0.9516 | +0.0161 (+1.7%) |
+| Precision@10 | **0.7290** | 0.7242 | 0.7226 | −0.0064 (−0.9%) |
+| activities NDCG@10 | 0.4002 | 0.4580 | **0.4840** | +0.0838 (+20.9%) |
+| budget NDCG@10 | 0.3445 | 0.4171 | **0.4171** | +0.0726 (+21.1%) |
+| adults_couples NDCG@10 | **0.9721** | 0.7841 | 0.8085 | −0.1636 (−16.8%) |
+| Latency p50 | **45 ms** | 54 ms | 180 ms | +135 ms (+300%) |
+
+**Core learning:** Multi-query expansion with `LocalQueryExpander` achieves better NDCG than rewriting (0.6285 vs 0.6130) because it preserves the original query signal while adding variants. The HitRate gain (+1.7% vs understand) is smaller than rewriting's gain (+3.4%) because word-substitution variants don't cover as much vocabulary space as targeted synonym expansion. The per-class analysis reveals an important pattern: expansion benefits classes with vocabulary mismatch problems (activities +20.9%, budget +21.1%) but hurts classes where hard constraint filtering already provides high precision (adults_couples −16.8%, exact_destination −11%). A production system would route query classes intelligently: use single-query + QU for destination/constraint queries; use multi-query for activities/budget/natural-language queries. The `QueryExpander` Protocol and `multi_query_search()` function are the building blocks for LLM-generated expansion (M12+) which would produce semantically diverse variants rather than lexical substitutions.

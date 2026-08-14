@@ -14,6 +14,7 @@ from travel_ai_search.config.settings import Settings
 from travel_ai_search.config.settings import get_settings as _get_settings
 from travel_ai_search.embeddings.base import EmbeddingProvider
 from travel_ai_search.query_understanding.base import QueryUnderstandingEngine
+from travel_ai_search.query_understanding.expander import QueryExpander
 from travel_ai_search.query_understanding.rewriter import QueryRewriter
 from travel_ai_search.reranking.base import Reranker
 
@@ -53,6 +54,15 @@ def get_query_rewriter(request: Request) -> QueryRewriter | None:
     Route handlers that accept an optional rewriter must check for None before use.
     """
     return getattr(request.app.state, "query_rewriter", None)
+
+
+def get_query_expander(request: Request) -> QueryExpander | None:
+    """Return the shared query expander stored on app state, or None if not created.
+
+    The expander is None when query_expansion_enabled=False in settings.
+    Route handlers that accept an optional expander must check for None before use.
+    """
+    return getattr(request.app.state, "query_expander", None)
 
 
 def get_settings() -> Settings:

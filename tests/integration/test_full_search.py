@@ -13,6 +13,7 @@ from opensearchpy import OpenSearch
 from travel_ai_search.api.app import app
 from travel_ai_search.embeddings.local import LocalEmbeddingProvider
 from travel_ai_search.llm.local import EchoLLMProvider, LocalLLMProvider
+from travel_ai_search.query_understanding.expander import IdentityQueryExpander, LocalQueryExpander
 from travel_ai_search.query_understanding.extractor import RuleBasedQueryUnderstandingEngine
 from travel_ai_search.query_understanding.rewriter import QueryRewriter
 
@@ -33,6 +34,7 @@ def api_client(
     from travel_ai_search.api.deps import (
         get_embedding_provider,
         get_os_client,
+        get_query_expander,
         get_query_rewriter,
         get_query_understanding_engine,
         get_reranker,
@@ -56,6 +58,10 @@ def api_client(
         # Expose a LocalLLMProvider-backed rewriter so rewrite=true tests work
         return QueryRewriter(LocalLLMProvider())
 
+    def _override_expander() -> LocalQueryExpander:
+        # Expose a LocalQueryExpander so expand=true tests work
+        return LocalQueryExpander()
+
     def _override_settings() -> Settings:
         s = Settings()
         # Point to the vector test index which has embeddings
@@ -67,6 +73,7 @@ def api_client(
     app.dependency_overrides[get_reranker] = _override_reranker
     app.dependency_overrides[get_query_understanding_engine] = _override_qu_engine
     app.dependency_overrides[get_query_rewriter] = _override_rewriter
+    app.dependency_overrides[get_query_expander] = _override_expander
     app.dependency_overrides[get_settings] = _override_settings
 
     with TestClient(app) as client:
@@ -288,3 +295,80 @@ def test_full_search_rewrite_with_echo_provider(api_client: TestClient) -> None:
         from travel_ai_search.query_understanding.rewriter import QueryRewriter as QR
 
         app.dependency_overrides[get_query_rewriter] = lambda: QR(LocalLLMProvider())
+
+
+# ── POST /search — multi-query expansion (Milestone 11) ──────────────────────
+
+
+def test_full_search_expand_false_has_null_expanded_queries(api_client: TestClient) -> None:
+    resp = api_client.post("/search", json={"query": "beach hotel", "expand": False})
+    data = resp.json()
+    assert data["expanded_queries"] is None
+
+
+def test_full_search_expand_default_is_false(api_client: TestClient) -> None:
+    resp = api_client.post("/search", json={"query": "beach hotel"})
+    data = resp.json()
+    assert data["expanded_queries"] is None
+
+
+def test_full_search_expand_true_returns_expanded_queries(api_client: TestClient) -> None:
+    resp = api_client.post("/search", json={"query": "beach resort", "expand": True})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["expanded_queries"] is not None
+    assert isinstance(data["expanded_queries"], list)
+    assert len(data["expanded_queries"]) >= 1
+
+
+def test_full_search_expand_n_queries_respected(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/search", json={"query": "beach resort", "expand": True, "n_queries": 3}
+    )
+    data = resp.json()
+    assert data["expanded_queries"] is not None
+    assert len(data["expanded_queries"]) == 3
+
+
+def test_full_search_expand_first_query_is_original_semantic(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/search", json={"query": "beach resort", "expand": True, "n_queries": 3}
+    )
+    data = resp.json()
+    semantic = data["query_understanding"]["semantic_query"]
+    assert data["expanded_queries"][0] == semantic
+
+
+def test_full_search_expand_returns_hits(api_client: TestClient) -> None:
+    resp = api_client.post("/search", json={"query": "beach hotel", "expand": True, "n_queries": 2})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["hits"]) > 0
+
+
+def test_full_search_expand_preserves_country_filter(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/search",
+        json={"query": "beach hotel in Spain", "expand": True, "n_queries": 3},
+    )
+    data = resp.json()
+    for hit in data["hits"]:
+        assert hit["country"] == "Spain"
+
+
+def test_full_search_expand_with_identity_expander(api_client: TestClient) -> None:
+    from travel_ai_search.api.deps import get_query_expander
+
+    def _identity_override() -> IdentityQueryExpander:
+        return IdentityQueryExpander()
+
+    app.dependency_overrides[get_query_expander] = _identity_override
+    try:
+        resp = api_client.post(
+            "/search", json={"query": "spa resort", "expand": True, "n_queries": 3}
+        )
+        data = resp.json()
+        # IdentityQueryExpander always returns [semantic_query]
+        assert data["expanded_queries"] == [data["query_understanding"]["semantic_query"]]
+    finally:
+        app.dependency_overrides[get_query_expander] = lambda: LocalQueryExpander()

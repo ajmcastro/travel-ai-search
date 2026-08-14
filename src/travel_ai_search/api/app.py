@@ -6,6 +6,7 @@ Resources created once at startup and stored on app.state:
   reranker                   — cross-encoder model (None when reranking_enabled=False)
   query_understanding_engine — rule-based QU engine (always created; pure Python, no I/O)
   query_rewriter             — LLM-based query rewriter (None when query_rewriting_enabled=False)
+  query_expander             — query expander for multi-query retrieval (None when disabled)
 
 All route handlers receive these via dependency functions in deps.py.
 """
@@ -66,6 +67,27 @@ def _create_query_rewriter(settings: Settings) -> QueryRewriter | None:
         return None
 
 
+def _create_query_expander(settings: Settings) -> object | None:
+    """Factory — returns None when query expansion is disabled.
+
+    Graceful degradation: a failed expander load logs a warning and the system
+    continues without expansion.  LocalQueryExpander is pure Python with no
+    external dependencies, so failure is unlikely in practice.
+    """
+    if not settings.query_expansion_enabled:
+        return None
+    try:
+        from travel_ai_search.query_understanding.expander import LocalQueryExpander
+
+        return LocalQueryExpander()
+    except Exception as exc:
+        logger.warning(
+            "Failed to create query expander: %s — expansion disabled.",
+            exc,
+        )
+        return None
+
+
 def _create_reranker(settings: Settings) -> Reranker | None:
     """Factory — returns None when reranking is disabled or the model fails to load.
 
@@ -95,6 +117,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.reranker = _create_reranker(settings)
     app.state.query_understanding_engine = _create_query_understanding_engine(settings)
     app.state.query_rewriter = _create_query_rewriter(settings)
+    app.state.query_expander = _create_query_expander(settings)
     yield
     app.state.os_client.close()
 
