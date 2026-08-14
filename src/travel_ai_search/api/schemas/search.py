@@ -5,6 +5,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict
 
 from travel_ai_search.api.schemas.query import QueryUnderstandResponse
+from travel_ai_search.rag.knowledge import DestinationKnowledge
 from travel_ai_search.retrieval.fusion import FusionMethod
 from travel_ai_search.retrieval.hybrid import HybridSearchResult
 from travel_ai_search.retrieval.lexical import LexicalSearchResult
@@ -125,6 +126,44 @@ class HybridSearchResponse(BaseModel):
         )
 
 
+class DestinationContextItem(BaseModel):
+    """Slim destination knowledge document returned in the RAG knowledge_context field.
+
+    Contains all human-readable fields from DestinationKnowledge; the
+    embedding_vector is excluded (large, not useful in a JSON response).
+    """
+
+    destination: str
+    country: str
+    region: str
+    description: str
+    climate: str
+    best_months: list[str]
+    family_suitability: str
+    nightlife_level: str
+    beach_quality: str
+    activities: list[str]
+    character_tags: list[str]
+    similar_destinations: list[str]
+
+    @classmethod
+    def from_knowledge(cls, k: DestinationKnowledge) -> DestinationContextItem:
+        return cls(
+            destination=k.destination,
+            country=k.country,
+            region=k.region,
+            description=k.description,
+            climate=k.climate,
+            best_months=k.best_months,
+            family_suitability=k.family_suitability,
+            nightlife_level=k.nightlife_level,
+            beach_quality=k.beach_quality,
+            activities=k.activities,
+            character_tags=k.character_tags,
+            similar_destinations=k.similar_destinations,
+        )
+
+
 class FullSearchRequest(BaseModel):
     """Request body for the full orchestrated search pipeline (POST /search).
 
@@ -143,10 +182,11 @@ class FullSearchRequest(BaseModel):
     rewrite: bool = False
     expand: bool = False
     n_queries: int = 3
+    rag: bool = False
 
 
 class FullSearchResponse(BaseModel):
-    """Response for POST /search — extends HybridSearchResponse with QU metadata."""
+    """Response for POST /search — extends HybridSearchResponse with QU and RAG metadata."""
 
     hits: list[SearchHit]
     total: int
@@ -157,6 +197,8 @@ class FullSearchResponse(BaseModel):
     query_understanding: QueryUnderstandResponse
     rewritten_query: str | None = None
     expanded_queries: list[str] | None = None
+    knowledge_context: list[DestinationContextItem] | None = None
+    rag_summary: str | None = None
 
     @classmethod
     def from_result(
@@ -166,6 +208,8 @@ class FullSearchResponse(BaseModel):
         *,
         rewritten_query: str | None = None,
         expanded_queries: list[str] | None = None,
+        knowledge_context: list[DestinationContextItem] | None = None,
+        rag_summary: str | None = None,
     ) -> FullSearchResponse:
         hits = [
             SearchHit.model_validate({"id": hit.id, "score": hit.score, **hit.source})
@@ -181,4 +225,6 @@ class FullSearchResponse(BaseModel):
             query_understanding=qu_response,
             rewritten_query=rewritten_query,
             expanded_queries=expanded_queries,
+            knowledge_context=knowledge_context,
+            rag_summary=rag_summary,
         )

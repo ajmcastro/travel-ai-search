@@ -111,6 +111,16 @@ class Settings(BaseSettings):
     reranker_provider: str = "local"
     bedrock_reranker_model_id: str = "cohere.rerank-v3-5:0"
 
+    # RAG / destination knowledge base (Milestone 13)
+    # rag_enabled: set True to create KnowledgeRetriever and RAGSynthesizer at startup.
+    #   When False, rag=true in POST /search is silently ignored.
+    # knowledge_index_name: OpenSearch index for destination documents.
+    #   Run `make ingest-knowledge` after changing this.
+    # rag_context_k: number of destination knowledge documents to retrieve per query.
+    rag_enabled: bool = False
+    knowledge_index_name: str = "travel_destinations"
+    rag_context_k: int = 3
+
 
 @lru_cache
 def get_settings() -> Settings:

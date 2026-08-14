@@ -102,6 +102,14 @@ generate-embeddings: ## Generate dense embeddings and update OpenSearch  [Milest
 .PHONY: embed
 embed: generate-embeddings ## Alias for generate-embeddings
 
+.PHONY: generate-knowledge
+generate-knowledge: ## Generate destination knowledge documents  [Milestone 13]
+	uv run python scripts/generate_knowledge.py
+
+.PHONY: ingest-knowledge
+ingest-knowledge: ## Create knowledge index and ingest destination docs  [Milestone 13]
+	uv run python scripts/ingest_knowledge.py
+
 # ── Evaluation ─────────────────────────────────────────────────────────────────
 
 .PHONY: evaluate

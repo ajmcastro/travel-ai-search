@@ -1435,3 +1435,87 @@ The measurable outcomes are:
 - mypy strict mode passes on 49 source files (with `[[tool.mypy.overrides]]` for boto3/botocore)
 - `embedding_provider`, `reranker_provider` settings enable runtime provider switching without code changes
 - Graceful degradation verified: any Bedrock provider failure falls back to local silently
+
+---
+
+## Milestone 13 — RAG / travel knowledge base
+
+### What we added
+
+A **destination knowledge base** — 30 documents, one per island/region in the synthetic dataset — stored in a separate OpenSearch index and retrieved semantically alongside hotel search.  When `rag=true` is passed to `POST /search`, a third retrieval fetches relevant destination context; optionally, the context and top hotel hits are passed to an LLM for a synthesized travel recommendation.
+
+Files added:
+- `src/travel_ai_search/rag/knowledge.py` — `DestinationKnowledge` Pydantic model, `build_knowledge_embedding_text()`
+- `src/travel_ai_search/rag/index.py` — `KNOWLEDGE_INDEX_NAME`, `build_knowledge_index_body(dimension)`, `create_knowledge_index()`
+- `src/travel_ai_search/rag/retriever.py` — `KnowledgeRetriever` (knn search with optional country pre-filter)
+- `src/travel_ai_search/rag/synthesizer.py` — `RAGSynthesizer` (prompt construction + LLM call)
+- `scripts/generate_knowledge.py` — generates `data/knowledge/destinations.jsonl`
+- `scripts/ingest_knowledge.py` — creates index, embeds, bulk-indexes
+
+API changes:
+- `FullSearchRequest`: new `rag: bool = False` field
+- `FullSearchResponse`: new `knowledge_context: list[DestinationContextItem] | None` and `rag_summary: str | None` fields
+- Settings: `rag_enabled`, `knowledge_index_name`, `rag_context_k`
+
+### Concepts
+
+#### Product retrieval vs knowledge retrieval
+
+The fundamental concept of this milestone is the distinction between two retrieval tasks:
+
+- **Product retrieval** (M1–M12): given a query, find and rank hotel documents that match it.  The answer is a ranked list of specific products.
+- **Knowledge retrieval**: given a query, find *facts about destinations* that inform the answer. The answer is context — a structured description of what a place is like, who it suits, and when to go.
+
+Conflating them would compromise both.  If destination knowledge were embedded into hotel descriptions, the hotel ranking would be biased by geographic facts rather than hotel-specific relevance.  If hotel-specific detail were in the knowledge base, the knowledge retrieval would return noisy, product-specific context rather than stable destination facts.
+
+#### Why one document per island/region, not per resort cluster
+
+The synthetic dataset has 34 resort clusters across ~30 unique islands or regions.  A knowledge document per cluster would have two problems:
+
+1. **Redundancy**: "What is the north of Tenerife like?" and "What is the south of Tenerife like?" share most of their knowledge (climate, cuisine, volcanic scenery).  One Tenerife document avoids this duplication.
+2. **Retrieval dilution**: with 34 documents, a knn query for "sunny island" would split its probability mass across near-duplicate Tenerife documents rather than concentrating it on the most-relevant island.
+
+#### Vector search for knowledge retrieval
+
+With only 30 documents, even brute-force exact search would be fast.  The choice of knn ANN search is deliberate as a demonstration:
+
+- **Semantic matching**: "somewhere warm and quiet for a family" should retrieve Menorca's document (matching "unspoiled", "family-friendly", "quiet") rather than just keyword-matching on "family" or "quiet".  Knn in the embedding space does this correctly.
+- **Architecture consistency**: using the same embedding model and index structure as hotel retrieval demonstrates that the RAG knowledge base is a first-class retrieval component, not a lookup table.
+- **Country pre-filter**: OpenSearch's filter-inside-knn applies the country filter before ANN scoring.  This prevents semantic leakage — a "beach holiday in Greece" query should not retrieve a Maldives knowledge document even if the embedding similarity is higher than any specific Greek island.
+
+#### RAG synthesis
+
+The synthesis step demonstrates Retrieval-Augmented Generation in its simplest form:
+
+1. Retrieve relevant context (knowledge documents)
+2. Construct a prompt that includes the query, the context, and the top retrieved products
+3. Call an LLM to generate a synthesized, grounded response
+
+The key constraint from the project spec is preserved: **search remains the core architecture**.  The RAG synthesis is additive — hotel ranking is identical whether `rag=true` or `rag=false`.  The synthesis can enrich the user's understanding of why the results are relevant, but it does not gate or replace the ranked list.
+
+#### Graceful degradation chain
+
+| Condition | Outcome |
+|---|---|
+| `rag=false` | No knowledge retrieval; no synthesis; zero latency overhead |
+| `rag=true`, `rag_enabled=false` in settings | Same as above (ignored) |
+| `rag=true`, knowledge index missing | Warning logged; hotel results returned; `knowledge_context=null` |
+| `rag=true`, knowledge found, no LLM | `knowledge_context` returned; `rag_summary=null` |
+| `rag=true`, knowledge found, LLM configured | Full response with both fields |
+
+### Design decisions
+
+| Decision | Chosen | Rejected alternative | Reason |
+|---|---|---|---|
+| Knowledge granularity | Island/region (30 docs) | Resort cluster (34 docs) | Avoids near-duplicate documents; cluster variants share the same island knowledge |
+| Knowledge embedding text | Description + climate + activities + tags | All fields | `geographic_note` and `similar_destinations` are factual/relational, not semantic profile; embedding them would add noise |
+| Knowledge index | Separate `travel_destinations` index | Hotel index with a `doc_type` field | Different schema, different retrieval purpose; mixing would complicate queries and mappings |
+| Country filter placement | knn `filter` clause (pre-filter) | Post-filter after ANN | Pre-filter guarantees we get top-k results *within the country*, not top-k globally then filtered |
+| LLM for synthesis | Reuses `llm_provider` setting | Separate `rag_llm_provider` | DRY: one Bedrock client, one credential configuration for both rewriting and synthesis |
+
+### What was not added
+
+- **Multi-turn RAG chat**: the spec explicitly says "do not turn the entire search engine into a chatbot". Synthesis is one-shot.
+- **Knowledge document freshness mechanism**: manual generation is sufficient for the educational scope.
+- **Semantic chunking of knowledge documents**: documents are short enough (one per island) that chunking adds no benefit.
+- **Knowledge evaluation metrics**: subjective quality of LLM synthesis is not measurable without human judgment labels.

@@ -49,7 +49,15 @@ select = ["E", "F", "I", "UP"]
 # Destination data rows are intentionally kept one-per-line for readability.
 "scripts/generate_dataset.py" = ["E501"]
 # Lambda criteria in the golden dataset builder are kept one-per-line for readability.
-"scripts/build_golden_dataset.py" = ["E501"]
+# sys.path.insert() before src imports is intentional in standalone scripts.
+"scripts/build_golden_dataset.py" = ["E402", "E501"]
+# sys.path.insert() before src imports is intentional in standalone scripts.
+"scripts/ingest_knowledge.py" = ["E402"]
+"scripts/ingest_data.py" = ["E402"]
+"scripts/generate_embeddings.py" = ["E402"]
+"scripts/create_index.py" = ["E402"]
+"scripts/evaluate.py" = ["E402"]
+"scripts/healthcheck.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.12"

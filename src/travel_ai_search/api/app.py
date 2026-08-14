@@ -7,6 +7,8 @@ Resources created once at startup and stored on app.state:
   query_understanding_engine — rule-based QU engine (always created; pure Python, no I/O)
   query_rewriter             — LLM-based query rewriter (None when query_rewriting_enabled=False)
   query_expander             — query expander for multi-query retrieval (None when disabled)
+  knowledge_retriever        — RAG knowledge retriever (None when rag_enabled=False)
+  rag_synthesizer            — RAG LLM synthesizer (None when rag_enabled=False)
 
 All route handlers receive these via dependency functions in deps.py.
 """
@@ -162,6 +164,77 @@ def _create_reranker(settings: Settings) -> Reranker | None:
         return None
 
 
+def _create_knowledge_retriever(
+    settings: Settings,
+    os_client: object,
+    embedding_provider: EmbeddingProvider,
+) -> object | None:
+    """Factory — returns None when rag_enabled=False or the retriever fails to initialise.
+
+    Graceful degradation: a failed retriever logs a warning and RAG is disabled
+    for this server instance.  The most common failure is the knowledge index not
+    existing yet — run `make ingest-knowledge` to populate it.
+    """
+    if not settings.rag_enabled:
+        return None
+    try:
+        from travel_ai_search.rag.retriever import KnowledgeRetriever
+
+        return KnowledgeRetriever(
+            os_client,  # type: ignore[arg-type]
+            embedding_provider,
+            index=settings.knowledge_index_name,
+            top_k=settings.rag_context_k,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to create KnowledgeRetriever: %s — RAG disabled.",
+            exc,
+        )
+        return None
+
+
+def _create_rag_synthesizer(settings: Settings) -> object | None:
+    """Factory — returns None when rag_enabled=False or the LLM fails to initialise.
+
+    Reuses the llm_provider setting: "bedrock" uses Claude via Converse API,
+    "echo" returns the prompt as-is (useful for local RAG pipeline testing),
+    "local" uses the keyword-substitution stub (limited synthesis quality).
+    """
+    if not settings.rag_enabled:
+        return None
+    try:
+        llm: LLMProvider
+        if settings.llm_provider == "bedrock":
+            from travel_ai_search.infrastructure.bedrock import create_bedrock_client
+            from travel_ai_search.llm.bedrock import BedrockLLMProvider
+
+            bedrock_client = create_bedrock_client(settings.aws_region)
+            llm = BedrockLLMProvider(bedrock_client, model_id=settings.bedrock_llm_model_id)
+            logger.info(
+                "RAG synthesizer using Bedrock LLM: %s",
+                settings.bedrock_llm_model_id,
+            )
+        elif settings.llm_provider == "echo":
+            from travel_ai_search.llm.local import EchoLLMProvider
+
+            llm = EchoLLMProvider()
+        else:
+            from travel_ai_search.llm.local import LocalLLMProvider
+
+            llm = LocalLLMProvider()
+        from travel_ai_search.rag.synthesizer import RAGSynthesizer
+
+        return RAGSynthesizer(llm)
+    except Exception as exc:
+        logger.warning(
+            "Failed to create RAGSynthesizer ('%s'): %s — synthesis disabled.",
+            settings.llm_provider,
+            exc,
+        )
+        return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
@@ -171,6 +244,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.query_understanding_engine = _create_query_understanding_engine(settings)
     app.state.query_rewriter = _create_query_rewriter(settings)
     app.state.query_expander = _create_query_expander(settings)
+    app.state.knowledge_retriever = _create_knowledge_retriever(
+        settings,
+        app.state.os_client,
+        app.state.embedding_provider,
+    )
+    app.state.rag_synthesizer = _create_rag_synthesizer(settings)
     yield
     app.state.os_client.close()
 

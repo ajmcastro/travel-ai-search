@@ -592,3 +592,42 @@ Results are also saved as machine-readable JSON under `data/evaluation/results/`
 - M12 (Bedrock): an LLM-generated expansion set would produce variants like "quiet Mediterranean family resort", "peaceful child-friendly beach destination southern Europe", "family coastal resort away from nightlife" — semantically diverse rather than word-substitution based. Would this close the gap with understand on precision while improving recall?
 - Can parallel retrieval (asyncio or threads) make multi-query latency competitive with single-query?
 - Is there a per-class routing heuristic — use single-query for `exact_destination`/`adults_couples` (where hard filters dominate), multi-query for `activities`/`budget` (where vocabulary mismatch is the main failure mode)?
+
+---
+
+## [Milestone 13] RAG / destination knowledge base
+
+**Date:** 2026-08-14
+
+**Hypothesis:** A separate destination knowledge base, searched semantically and used to augment the LLM synthesis prompt, will produce richer and more contextually accurate travel recommendations than hotel search alone.  The product retrieval pipeline (hotel ranking) should remain unchanged — RAG is purely additive.
+
+**Configuration:**
+- Knowledge base: 30 destination documents, one per island/region
+- Knowledge index: `travel_destinations` (OpenSearch knn_vector, same dimension as hotel index)
+- Knowledge retrieval: knn ANN search on `embedding_vector` (all-MiniLM-L6-v2, 384d)
+- Optional country filter from QueryUnderstandingEngine
+- LLM synthesis: configurable via `llm_provider` setting (`local`, `echo`, or `bedrock`)
+- RAG prompt: query + knowledge context + top-5 hotel summaries → 2-3 sentence recommendation
+
+**No numeric evaluation conducted:**
+
+RAG synthesis quality depends on LLM availability (Bedrock credentials) and is inherently subjective.  The key assertions are architectural:
+
+1. Hotel ranking is provably unchanged when `rag=false` (RAG adds no latency)
+2. Knowledge retrieval returns semantically correct destinations (verified by spot-checking `rag=true` queries)
+3. Country filter from QU prevents cross-country semantic leakage (e.g. "beach holiday in Greece" should not retrieve Caribbean knowledge)
+
+**Architectural observations:**
+
+1. **Product retrieval vs knowledge retrieval separation is the core lesson.** Embedding hotel descriptions into the knowledge documents would conflate two retrieval tasks that have different semantics. Destination knowledge ("what is Menorca like?") is stable and shared; hotel descriptions are specific and ranked. Keeping them in separate indices makes both better.
+
+2. **The knn country filter demonstrates OpenSearch's pre-filter mode.** The `filter` clause inside the `knn` query block is applied before ANN scoring — only documents in the given country are candidates. Without this, "beach holiday in Greece" could retrieve a Maldives knowledge document because the semantic similarity is higher than any specific Greek island.
+
+3. **EchoLLMProvider is the right local testing backend.** `LLM_PROVIDER=echo` returns the prompt as the synthesis output. This is sufficient to verify that the prompt is correctly structured, contains the destination names and hotel names, and has the right length — without needing AWS credentials.
+
+4. **Graceful degradation chain:** `rag=false` → no overhead; `rag=true` + missing index → warning + hotel results only; `rag=true` + index OK + no LLM → `knowledge_context` returned, no `rag_summary`; `rag=true` + index OK + LLM configured → full response.
+
+**Next questions this raises:**
+- Would a BM25 knowledge retrieval (term matching on destination name) outperform knn for exact-name queries ("tell me about Mallorca") while knn beats it for semantic queries ("somewhere like Mallorca but quieter")?
+- Could the knowledge documents be automatically refreshed from authoritative sources (Wikipedia infoboxes, travel authority data) rather than being manually curated?
+- M14 (graph-enhanced retrieval): could "similar_destinations" fields in knowledge documents seed a graph of destination similarity, enabling "travellers who liked Menorca also liked Corfu" style recommendations?

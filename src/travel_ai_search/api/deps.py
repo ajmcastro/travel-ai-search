@@ -65,6 +65,24 @@ def get_query_expander(request: Request) -> QueryExpander | None:
     return getattr(request.app.state, "query_expander", None)
 
 
+def get_knowledge_retriever(request: Request) -> object | None:
+    """Return the shared KnowledgeRetriever stored on app state, or None if not created.
+
+    The retriever is None when rag_enabled=False in settings or when the knowledge
+    index has not been populated yet.  Route handlers must check for None before use.
+    """
+    return getattr(request.app.state, "knowledge_retriever", None)
+
+
+def get_rag_synthesizer(request: Request) -> object | None:
+    """Return the shared RAGSynthesizer stored on app state, or None if not created.
+
+    The synthesizer is None when rag_enabled=False or the LLM provider failed to
+    initialise.  Route handlers must check for None before use.
+    """
+    return getattr(request.app.state, "rag_synthesizer", None)
+
+
 def get_settings() -> Settings:
     """Return the application settings singleton."""
     return _get_settings()

@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, Query
 from opensearchpy import OpenSearch
 
 from travel_ai_search.api.deps import (
     get_embedding_provider,
+    get_knowledge_retriever,
     get_os_client,
     get_query_expander,
     get_query_rewriter,
     get_query_understanding_engine,
+    get_rag_synthesizer,
     get_reranker,
     get_settings,
 )
 from travel_ai_search.api.schemas.query import QueryUnderstandResponse
 from travel_ai_search.api.schemas.search import (
+    DestinationContextItem,
     FullSearchRequest,
     FullSearchResponse,
     HybridSearchResponse,
@@ -33,6 +38,8 @@ from travel_ai_search.retrieval.hybrid import HybridSearchParams, hybrid_search
 from travel_ai_search.retrieval.lexical import LexicalSearchParams, lexical_search
 from travel_ai_search.retrieval.multi_query import multi_query_search
 from travel_ai_search.retrieval.vector import VectorSearchParams, vector_search
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Search"])
 
@@ -206,6 +213,8 @@ def full_search_endpoint(
     qu_engine: QueryUnderstandingEngine = Depends(get_query_understanding_engine),
     query_rewriter: QueryRewriter | None = Depends(get_query_rewriter),
     query_expander: QueryExpander | None = Depends(get_query_expander),
+    knowledge_retriever: object | None = Depends(get_knowledge_retriever),
+    rag_synthesizer: object | None = Depends(get_rag_synthesizer),
     settings: Settings = Depends(get_settings),
 ) -> FullSearchResponse:
     """Full orchestrated search pipeline: QU → optional rewriting → optional expansion → retrieval.
@@ -279,9 +288,39 @@ def full_search_endpoint(
             reranker=active_reranker,
         )
 
+    # Optional RAG: knowledge retrieval + LLM synthesis.
+    # Runs after hotel retrieval so it does not affect hotel ranking.
+    knowledge_context: list[DestinationContextItem] | None = None
+    rag_summary: str | None = None
+    if body.rag and knowledge_retriever is not None:
+        from travel_ai_search.rag.knowledge import DestinationKnowledge
+        from travel_ai_search.rag.retriever import KnowledgeRetriever
+
+        raw_knowledge: list[DestinationKnowledge] = []
+        try:
+            retriever: KnowledgeRetriever = knowledge_retriever  # type: ignore[assignment]
+            raw_knowledge = retriever.retrieve(
+                qu.semantic_query,
+                country=qu.country,
+            )
+            knowledge_context = [DestinationContextItem.from_knowledge(k) for k in raw_knowledge]
+        except Exception as exc:
+            logger.warning("Knowledge retrieval failed: %s — skipping RAG.", exc)
+
+        if raw_knowledge and rag_synthesizer is not None:
+            try:
+                from travel_ai_search.rag.synthesizer import RAGSynthesizer
+
+                synthesizer: RAGSynthesizer = rag_synthesizer  # type: ignore[assignment]
+                rag_summary = synthesizer.synthesize(body.query, result.hits, raw_knowledge)
+            except Exception as exc:
+                logger.warning("RAG synthesis failed: %s — returning knowledge context only.", exc)
+
     return FullSearchResponse.from_result(
         result,
         qu_response,
         rewritten_query=rewritten_query,
         expanded_queries=expanded_queries,
+        knowledge_context=knowledge_context,
+        rag_summary=rag_summary,
     )

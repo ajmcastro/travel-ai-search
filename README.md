@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 12 — AWS Bedrock providers
+## Current status: Milestone 13 — RAG / travel knowledge base
 
 | # | Milestone | Status |
 |---|---|---|
@@ -22,8 +22,8 @@ An educational, production-quality project demonstrating modern AI search archit
 | 9 | Query understanding and structured constraints | ✅ Complete |
 | 10 | Query rewriting | ✅ Complete |
 | 11 | Multi-query retrieval | ✅ Complete |
-| 12 | AWS Bedrock providers | ✅ **Complete** |
-| 13 | RAG / travel knowledge base | Pending |
+| 12 | AWS Bedrock providers | ✅ Complete |
+| 13 | RAG / travel knowledge base | ✅ **Complete** |
 | 14 | Graph-enhanced retrieval prototype | Pending |
 | 15 | Production API, observability, resilience | Pending |
 
@@ -47,6 +47,7 @@ An educational, production-quality project demonstrating modern AI search archit
 - Rewrite (M10) — QU + `LocalLLMProvider` keyword expansion + RRF: **HitRate improves +3.4%** (more relevant hotels in top-10) but NDCG and MRR regress vs Understand (−2.9%, −4.6%). Classic precision-recall tradeoff: naive synonym expansion broadens recall but dilutes the ranking signal. `activities` class +14.4%. Architecture ready for real LLM (M12).
 - Expand (M11) — QU + `LocalQueryExpander` (N=3 variants) + 6-list RRF: beats rewrite on NDCG (0.629 vs 0.613) because the original query is preserved as the first variant. `activities` +20.9%, `budget` +21.1% (vocabulary mismatch classes benefit most). Cost: 4× latency (180 ms) due to sequential retrieval. `adults_couples` −16.8% (hard constraint filtering is more effective than expansion for this class). Architecture in place for LLM-generated diverse expansion variants (M12).
 - Bedrock (M12) — `BedrockEmbeddingProvider` (Titan V2), `BedrockLLMProvider` (Claude via Converse API), `BedrockReranker` (Cohere Rerank v3.5): all three provider slots now support AWS Bedrock as a drop-in replacement for local providers. Activated via `EMBEDDING_PROVIDER=bedrock`, `LLM_PROVIDER=bedrock`, `RERANKER_PROVIDER=bedrock`. Graceful degradation: any Bedrock initialisation failure logs a warning and falls back to local. AWS credentials are never required to run the system.
+- RAG (M13) — destination knowledge base: 30 documents (one per island/region), stored in a separate `travel_destinations` OpenSearch index and retrieved semantically alongside hotel search. `POST /search` with `rag=true` returns `knowledge_context` (structured destination facts) and optionally `rag_summary` (LLM-synthesized recommendation). Hotel ranking is unchanged — RAG is purely additive. Demonstrates the core distinction between product retrieval (rank hotels) and knowledge retrieval (explain destinations). Country pre-filter from QU prevents cross-country semantic leakage.
 
 Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
@@ -109,6 +110,13 @@ make ingest
 # Generate dense embeddings and write to OpenSearch (Milestone 5+)
 # Downloads all-MiniLM-L6-v2 (~80 MB) on first run; ~14 s for 5,470 hotels
 make generate-embeddings
+
+# Generate destination knowledge documents (Milestone 13)
+make generate-knowledge
+
+# Create knowledge index and ingest 30 destination documents (Milestone 13)
+# Requires: make up + make generate-knowledge first
+make ingest-knowledge
 ```
 
 Expected output from `make ingest`:
@@ -222,6 +230,13 @@ curl -X POST "localhost:8000/query/understand" \
 curl -X POST "localhost:8000/search" \
   -H "Content-Type: application/json" \
   -d '{"query": "something quiet with a pool", "rewrite": true}'
+
+# RAG: knowledge retrieval + optional LLM synthesis (Milestone 13)
+# Requires: RAG_ENABLED=true in .env + make ingest-knowledge
+# Returns knowledge_context (destination facts) + rag_summary (if LLM configured)
+curl -X POST "localhost:8000/search" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "relaxed beach holiday in Greece", "rag": true}'
 ```
 
 Response shape:
@@ -322,8 +337,11 @@ Copy `.env.example` to `.env` (or run `make env`) and adjust as needed. All sett
 | `AWS_REGION` | `us-east-1` | AWS region for Bedrock API calls |
 | `BEDROCK_EMBEDDING_MODEL_ID` | `amazon.titan-embed-text-v2:0` | Titan Embeddings model ID |
 | `BEDROCK_EMBEDDING_DIMENSION` | `1024` | Titan output dimension (256/512/1024) — must also update `EMBEDDING_DIMENSION` and recreate the index |
-| `BEDROCK_LLM_MODEL_ID` | `anthropic.claude-haiku-4-5-20251001` | Bedrock model for query rewriting |
+| `BEDROCK_LLM_MODEL_ID` | `anthropic.claude-haiku-4-5-20251001` | Bedrock model for query rewriting and RAG synthesis |
 | `BEDROCK_RERANKER_MODEL_ID` | `cohere.rerank-v3-5:0` | Cohere Rerank model ID |
+| `RAG_ENABLED` | `false` | Enable knowledge retrieval + synthesis at startup (set `true` after `make ingest-knowledge`) |
+| `KNOWLEDGE_INDEX_NAME` | `travel_destinations` | OpenSearch index for destination knowledge documents |
+| `RAG_CONTEXT_K` | `3` | Number of destination knowledge docs to retrieve per RAG query |
 
 ---
 
@@ -371,6 +389,12 @@ src/travel_ai_search/
 │   ├── lexical.py           # BM25 multi-match search: lexical_search()
 │   ├── vector.py            # ANN search: vector_search(), _build_vector_query()
 │   └── hybrid.py            # Hybrid orchestration: hybrid_search(), HybridSearchParams
+├── rag/                     # RAG / destination knowledge (M13)
+│   ├── __init__.py
+│   ├── knowledge.py         # DestinationKnowledge model, build_knowledge_embedding_text()
+│   ├── index.py             # Knowledge index mapping, create_knowledge_index()
+│   ├── retriever.py         # KnowledgeRetriever (knn + optional country filter)
+│   └── synthesizer.py       # RAGSynthesizer (prompt construction + LLM call)
 └── infrastructure/
     ├── opensearch.py        # OpenSearch client factory
     └── bedrock.py           # boto3 bedrock-runtime client factory (M12)
@@ -380,6 +404,8 @@ scripts/
 ├── create_index.py          # Create OpenSearch index (knn enabled)
 ├── ingest_data.py           # Bulk-index dataset into OpenSearch
 ├── generate_embeddings.py   # Offline: embed all hotels, update OpenSearch
+├── generate_knowledge.py    # Generate destination knowledge documents (M13)
+├── ingest_knowledge.py      # Create knowledge index and ingest 30 docs (M13)
 ├── build_golden_dataset.py  # Build golden evaluation dataset (one-time)
 ├── evaluate.py              # Run evaluation: --strategy bm25|vector|hybrid|rrf|rerank|understand|rewrite
 └── healthcheck.py           # Verify OpenSearch connectivity
@@ -387,12 +413,14 @@ scripts/
 data/
 ├── processed/
 │   └── hotels.jsonl         # Generated dataset (gitignored)
+├── knowledge/
+│   └── destinations.jsonl   # 30 destination knowledge documents (M13)
 └── evaluation/
     ├── golden_queries.jsonl # 62 queries, 48,675 graded judgments
     └── results/             # JSON evaluation results per run
 
 tests/
-├── unit/                    # No infrastructure required (420 tests)
+├── unit/                    # No infrastructure required (459 tests)
 └── integration/             # Requires OpenSearch running (132 tests)
 ```
 
