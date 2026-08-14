@@ -417,6 +417,10 @@ make down-v       # stop containers and delete data volume
 
 See [`docs/RATIONALE_PER_MILESTONE.md`](docs/RATIONALE_PER_MILESTONE.md) for the IR concepts, design choices, and rationale behind each milestone. Experiment logs and measured results are in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
+## Development
+
+This project was designed and implemented by Antonio de Castro, with AI-assisted development using Claude Code (model Sonnet4.6).
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
