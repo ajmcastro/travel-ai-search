@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 11 — Multi-query retrieval
+## Current status: Milestone 12 — AWS Bedrock providers
 
 | # | Milestone | Status |
 |---|---|---|
@@ -21,8 +21,8 @@ An educational, production-quality project demonstrating modern AI search archit
 | 8 | Cross-encoder reranking | ✅ Complete |
 | 9 | Query understanding and structured constraints | ✅ Complete |
 | 10 | Query rewriting | ✅ Complete |
-| 11 | Multi-query retrieval | ✅ **Complete** |
-| 12 | AWS Bedrock providers | Pending |
+| 11 | Multi-query retrieval | ✅ Complete |
+| 12 | AWS Bedrock providers | ✅ **Complete** |
 | 13 | RAG / travel knowledge base | Pending |
 | 14 | Graph-enhanced retrieval prototype | Pending |
 | 15 | Production API, observability, resilience | Pending |
@@ -46,6 +46,7 @@ An educational, production-quality project demonstrating modern AI search archit
 - Understand (M9) — rule-based QU + RRF: beats RRF on NDCG (+1.2%) and MRR (+2.0%) while being **20% faster** (45 ms vs 56 ms p50). `adults_couples` NDCG +8.9% (correct `adults_only` filter extracted). Main failure: false-positive constraints on `budget` queries (−18.4%).
 - Rewrite (M10) — QU + `LocalLLMProvider` keyword expansion + RRF: **HitRate improves +3.4%** (more relevant hotels in top-10) but NDCG and MRR regress vs Understand (−2.9%, −4.6%). Classic precision-recall tradeoff: naive synonym expansion broadens recall but dilutes the ranking signal. `activities` class +14.4%. Architecture ready for real LLM (M12).
 - Expand (M11) — QU + `LocalQueryExpander` (N=3 variants) + 6-list RRF: beats rewrite on NDCG (0.629 vs 0.613) because the original query is preserved as the first variant. `activities` +20.9%, `budget` +21.1% (vocabulary mismatch classes benefit most). Cost: 4× latency (180 ms) due to sequential retrieval. `adults_couples` −16.8% (hard constraint filtering is more effective than expansion for this class). Architecture in place for LLM-generated diverse expansion variants (M12).
+- Bedrock (M12) — `BedrockEmbeddingProvider` (Titan V2), `BedrockLLMProvider` (Claude via Converse API), `BedrockReranker` (Cohere Rerank v3.5): all three provider slots now support AWS Bedrock as a drop-in replacement for local providers. Activated via `EMBEDDING_PROVIDER=bedrock`, `LLM_PROVIDER=bedrock`, `RERANKER_PROVIDER=bedrock`. Graceful degradation: any Bedrock initialisation failure logs a warning and falls back to local. AWS credentials are never required to run the system.
 
 Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
@@ -313,7 +314,16 @@ Copy `.env.example` to `.env` (or run `make env`) and adjust as needed. All sett
 | `RERANK_K` | `50` | Default candidates to pass to the cross-encoder |
 | `QUERY_UNDERSTANDING_ENABLED` | `true` | Enable rule-based QU engine at startup (pure Python; no download needed) |
 | `QUERY_REWRITING_ENABLED` | `false` | Enable query rewriter at startup (set `true` to allow `rewrite=true` on POST /search) |
-| `LLM_PROVIDER` | `local` | LLM backend: `local` (keyword expansion), `echo` (identity stub), `bedrock` (M12) |
+| `LLM_PROVIDER` | `local` | LLM backend: `local` (keyword expansion), `echo` (identity stub), `bedrock` (Claude via Converse API) |
+| `QUERY_EXPANSION_ENABLED` | `false` | Enable multi-query expander at startup |
+| `NUM_EXPANSION_QUERIES` | `3` | Number of query variants to generate per request |
+| `EMBEDDING_PROVIDER` | `local` | Embedding backend: `local` (sentence-transformers) or `bedrock` (Titan V2) |
+| `RERANKER_PROVIDER` | `local` | Reranker backend: `local` (cross-encoder) or `bedrock` (Cohere Rerank v3.5) |
+| `AWS_REGION` | `us-east-1` | AWS region for Bedrock API calls |
+| `BEDROCK_EMBEDDING_MODEL_ID` | `amazon.titan-embed-text-v2:0` | Titan Embeddings model ID |
+| `BEDROCK_EMBEDDING_DIMENSION` | `1024` | Titan output dimension (256/512/1024) — must also update `EMBEDDING_DIMENSION` and recreate the index |
+| `BEDROCK_LLM_MODEL_ID` | `anthropic.claude-haiku-4-5-20251001` | Bedrock model for query rewriting |
+| `BEDROCK_RERANKER_MODEL_ID` | `cohere.rerank-v3-5:0` | Cohere Rerank model ID |
 
 ---
 
@@ -333,7 +343,8 @@ src/travel_ai_search/
 │   └── models.py            # TravelProduct model + build_embedding_text()
 ├── embeddings/
 │   ├── base.py              # EmbeddingProvider Protocol
-│   └── local.py             # LocalEmbeddingProvider (sentence-transformers)
+│   ├── local.py             # LocalEmbeddingProvider (sentence-transformers)
+│   └── bedrock.py           # BedrockEmbeddingProvider (Titan V2, M12)
 ├── evaluation/
 │   ├── dataset.py           # GoldenQuery, GoldenDataset, load_dataset()
 │   ├── evaluator.py         # evaluate(), EvaluationReport, SearchFn type
@@ -343,7 +354,8 @@ src/travel_ai_search/
 │   └── ingestor.py          # Bulk ingestion: load_products(), ingest()
 ├── llm/
 │   ├── base.py              # LLMProvider Protocol (runtime_checkable)
-│   └── local.py             # EchoLLMProvider (identity stub), LocalLLMProvider (keyword expansion)
+│   ├── local.py             # EchoLLMProvider (identity stub), LocalLLMProvider (keyword expansion)
+│   └── bedrock.py           # BedrockLLMProvider (Claude via Converse API, M12)
 ├── query_understanding/
 │   ├── base.py              # QueryUnderstandingEngine Protocol (runtime_checkable)
 │   ├── models.py            # QueryUnderstanding dataclass + to_search_filters()
@@ -351,7 +363,8 @@ src/travel_ai_search/
 │   └── rewriter.py          # QueryRewriter (wraps LLMProvider; graceful fallback)
 ├── reranking/
 │   ├── base.py              # Reranker Protocol (runtime_checkable, structural typing)
-│   └── local.py             # LocalCrossEncoderReranker (sentence-transformers CrossEncoder)
+│   ├── local.py             # LocalCrossEncoderReranker (sentence-transformers CrossEncoder)
+│   └── bedrock.py           # BedrockReranker (Cohere Rerank v3.5, M12)
 ├── retrieval/
 │   ├── types.py             # Shared Hit dataclass (imported by all retrieval modules)
 │   ├── fusion.py            # FusionMethod enum, fuse_results() (weighted), rrf_fuse() (RRF)
@@ -359,7 +372,8 @@ src/travel_ai_search/
 │   ├── vector.py            # ANN search: vector_search(), _build_vector_query()
 │   └── hybrid.py            # Hybrid orchestration: hybrid_search(), HybridSearchParams
 └── infrastructure/
-    └── opensearch.py        # OpenSearch client factory
+    ├── opensearch.py        # OpenSearch client factory
+    └── bedrock.py           # boto3 bedrock-runtime client factory (M12)
 
 scripts/
 ├── generate_dataset.py      # Generate synthetic JSONL dataset
@@ -378,8 +392,8 @@ data/
     └── results/             # JSON evaluation results per run
 
 tests/
-├── unit/                    # No infrastructure required (342 tests)
-└── integration/             # Requires OpenSearch running (124 tests)
+├── unit/                    # No infrastructure required (420 tests)
+└── integration/             # Requires OpenSearch running (132 tests)
 ```
 
 ---

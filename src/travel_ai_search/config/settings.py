@@ -86,6 +86,31 @@ class Settings(BaseSettings):
     query_expansion_enabled: bool = False
     num_expansion_queries: int = 3
 
+    # AWS Bedrock (Milestone 12)
+    # AWS is optional — the full system runs locally without these settings.
+    # aws_region: Bedrock API region.  us-east-1 has the widest model availability.
+    #
+    # embedding_provider: "local" (sentence-transformers) or "bedrock" (Titan Embeddings).
+    #   Switching local→bedrock changes the vector dimension (384→1024 by default),
+    #   which requires recreating the OpenSearch index.  Set both embedding_dimension
+    #   and bedrock_embedding_dimension to 1024, then run:
+    #     make create-index && make generate-embeddings
+    # bedrock_embedding_model_id: Amazon Titan Embeddings V2 model ID.
+    # bedrock_embedding_dimension: output dimension (256, 512, or 1024).
+    #
+    # llm_provider: "local", "echo", or "bedrock" (Claude via Converse API).
+    # bedrock_llm_model_id: any Converse-compatible model ID on Bedrock.
+    #
+    # reranker_provider: "local" (ms-marco cross-encoder) or "bedrock" (Cohere Rerank).
+    # bedrock_reranker_model_id: Cohere Rerank model ID.
+    aws_region: str = "us-east-1"
+    embedding_provider: str = "local"
+    bedrock_embedding_model_id: str = "amazon.titan-embed-text-v2:0"
+    bedrock_embedding_dimension: int = 1024
+    bedrock_llm_model_id: str = "anthropic.claude-haiku-4-5-20251001"
+    reranker_provider: str = "local"
+    bedrock_reranker_model_id: str = "cohere.rerank-v3-5:0"
+
 
 @lru_cache
 def get_settings() -> Settings:

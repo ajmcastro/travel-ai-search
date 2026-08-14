@@ -9,6 +9,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "boto3>=1.35.0",
     "fastapi>=0.141.1",
     "opensearch-py>=2.7.0",
     "pydantic-settings>=2.6.0",
@@ -54,3 +55,7 @@ select = ["E", "F", "I", "UP"]
 python_version = "3.12"
 strict = true
 mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["boto3", "botocore.*"]
+ignore_missing_imports = true

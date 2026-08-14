@@ -1334,3 +1334,104 @@ For N=3 queries: 3 BM25 + 3 vector = 6 sequential OpenSearch requests. Single-qu
 | Latency p50 | **45 ms** | 54 ms | 180 ms | +135 ms (+300%) |
 
 **Core learning:** Multi-query expansion with `LocalQueryExpander` achieves better NDCG than rewriting (0.6285 vs 0.6130) because it preserves the original query signal while adding variants. The HitRate gain (+1.7% vs understand) is smaller than rewriting's gain (+3.4%) because word-substitution variants don't cover as much vocabulary space as targeted synonym expansion. The per-class analysis reveals an important pattern: expansion benefits classes with vocabulary mismatch problems (activities +20.9%, budget +21.1%) but hurts classes where hard constraint filtering already provides high precision (adults_couples −16.8%, exact_destination −11%). A production system would route query classes intelligently: use single-query + QU for destination/constraint queries; use multi-query for activities/budget/natural-language queries. The `QueryExpander` Protocol and `multi_query_search()` function are the building blocks for LLM-generated expansion (M12+) which would produce semantically diverse variants rather than lexical substitutions.
+
+---
+
+## Milestone 12 — AWS Bedrock provider implementations
+
+### What we added
+
+Three production-grade cloud provider implementations, each satisfying an existing Protocol via structural typing:
+
+- **`BedrockEmbeddingProvider`** (`embeddings/bedrock.py`) — Amazon Titan Embeddings V2 via `invoke_model`
+- **`BedrockLLMProvider`** (`llm/bedrock.py`) — Any Converse-API-compatible model (Claude, Titan Text, Llama, etc.) via `converse`
+- **`BedrockReranker`** (`reranking/bedrock.py`) — Cohere Rerank v3.5 via `invoke_model`
+- **`create_bedrock_client`** (`infrastructure/bedrock.py`) — shared `bedrock-runtime` boto3 client factory
+- **Settings** — `embedding_provider`, `reranker_provider`, `aws_region`, `bedrock_*_model_id` flags
+- **App factories** — updated `_create_embedding_provider`, `_create_query_rewriter`, `_create_reranker` with Bedrock paths and graceful fallback to local
+- **41 unit tests** (`tests/unit/test_bedrock_providers.py`) — all mock boto3; no real AWS calls required
+
+### IR / ML concepts
+
+#### AWS Bedrock as a frontier model gateway
+
+Bedrock is a managed API surface that routes requests to models from multiple providers (Amazon, Anthropic, Cohere, Meta, Mistral) through a single boto3 client. For search, this matters because:
+
+- **Embedding quality**: Titan V2 is trained on a larger, more diverse corpus than `all-MiniLM-L6-v2`. It handles proper nouns (hotel names, destinations) better and supports three dimension settings (256/512/1024) to trade off index size against recall quality.
+- **LLM rewriting quality**: A real Claude call understands semantic context that `LocalLLMProvider`'s keyword rules cannot — "like Mallorca but quieter" can be rewritten to "peaceful coastal resort Mediterranean" because the model knows Mallorca's character.
+- **Reranker quality**: Cohere Rerank v3.5 is a dedicated cross-encoder with multilingual support and calibrated 0–1 relevance scores, trained on real e-commerce ranking data — stronger generalisation than the MS-MARCO cross-encoder for non-passage retrieval tasks.
+
+#### The Converse API
+
+The Bedrock Converse API provides a model-agnostic interface to conversational models. Instead of raw JSON prompt engineering (which varies by model), it normalises the input as `messages` (list of `{role, content}` turns) plus an optional `system` prompt. This maps directly to the `LLMProvider.generate(prompt, *, system)` Protocol — the Protocol was designed with this mapping in mind since M10, so adding the Bedrock backend requires no interface change.
+
+#### Credentials are never committed
+
+boto3 uses the standard AWS credential chain: environment variables → `~/.aws/credentials` → IAM instance profile. The `create_bedrock_client` factory creates the client from that chain — no credentials appear in code. For local development, environment variables or `~/.aws/credentials` are used. For production (ECS/Lambda/EC2), IAM roles are the right mechanism. `.env.example` explicitly instructs users never to commit credentials.
+
+#### Graceful degradation: the optionality guarantee
+
+A design requirement from the project spec: "AWS is always optional; the full system must run locally without AWS credentials." Each of the three factory functions in `app.py` wraps the Bedrock path in a try/except:
+
+```
+EMBEDDING_PROVIDER=bedrock + missing credentials
+  → warning: "Failed to create Bedrock embedding provider: ... — falling back to local."
+  → LocalEmbeddingProvider created instead
+  → system starts normally
+```
+
+This applies to all three providers. Failing to create a Bedrock provider never prevents the API from starting.
+
+#### Titan V2 dimensions and index compatibility
+
+Titan V2 supports three dimension sizes: 256, 512, and 1024 (default). The dimension is chosen at embedding time and is immutable in the OpenSearch index (the `knn_vector` mapping hardcodes the dimension). Switching from local (384d) to Titan (1024d) requires:
+
+1. Set `EMBEDDING_DIMENSION=1024` and `BEDROCK_EMBEDDING_DIMENSION=1024` together
+2. Recreate the index: `make create-index`
+3. Re-embed all hotels: `make generate-embeddings`
+
+This is a key operational constraint worth documenting: **you cannot mix embedding providers within the same index**.
+
+#### Cohere Rerank via `invoke_model` (not `bedrock-agent-runtime`)
+
+Amazon provides two paths to reranking on Bedrock:
+1. **Amazon Reranker** (`amazon.rerank-v1:0`) via `bedrock-agent-runtime.rerank()` — the agent-specific endpoint
+2. **Cohere Rerank** (`cohere.rerank-v3-5:0`) via `bedrock-runtime.invoke_model()` — plain JSON in/out
+
+We chose Cohere via `invoke_model` for two reasons:
+- The request/response shape is simpler JSON (same pattern as Titan Embeddings) with no separate agent-runtime client
+- `cohere.rerank-v3-5:0` is a state-of-the-art reranker with wider regional availability and a well-documented JSON API
+
+Both use the same `bedrock-runtime` client as the embedding and LLM providers — one boto3 client factory, three providers.
+
+#### Document text consistency across rerankers
+
+`BedrockReranker._build_reranking_text()` uses the same field selection and pipe-separated format as `LocalCrossEncoderReranker._build_reranking_text()`. Both rerankers see identical document representations, which enables fair A/B quality comparison when switching between local and Bedrock rerankers. This is a small but important design decision: if the text serialisation differed, the comparison would measure the serialisation difference, not the model quality difference.
+
+### Key design decisions
+
+| Decision | Chosen | Rejected | Why |
+|---|---|---|---|
+| All Bedrock providers share one client | `bedrock-runtime` for all three | Separate client per provider | Titan, Cohere, and Converse API all use `invoke_model` / `converse` on the same endpoint; one factory, one client |
+| boto3 as regular dependency | `dependencies = ["boto3>=1.35.0"]` | Optional extra (`bedrock = ["boto3"]`) | Simpler install; boto3 is widely installed; credentials are what's optional, not the library |
+| mypy override for boto3/botocore | `[[tool.mypy.overrides]]` | `# type: ignore` on every import | One override silences all files; inline ignores would spread across three new files |
+| Cohere reranker via invoke_model | `invoke_model` JSON | `bedrock-agent-runtime.rerank()` | Simpler client setup; same boto3 client as embeddings; wider availability |
+| LLMProvider typed at call site | `llm: LLMProvider` annotation | No annotation (infer from first branch) | mypy strict mode cannot union `BedrockLLMProvider | EchoLLMProvider | LocalLLMProvider` without an explicit annotation |
+| No embed_batch endpoint for Titan | Loop over texts | Fake batching | Titan V2 has no batch endpoint; looping is the only correct implementation |
+| Credentials via boto3 chain | Standard env/file/IAM | Explicit parameters | Industry standard; never commits credentials; works seamlessly in CI/CD with IAM roles |
+
+### What was not added (and why)
+
+**Bedrock evaluation results**: Bedrock requires real AWS credentials and incurs API costs. Re-indexing with Titan 1024d would replace the existing 384d evaluation baseline, making it impossible to compare fairly without running two separate indices. For this educational project, the evaluation section of `EXPERIMENTS.md` documents the architecture change but no numeric results — because the results depend on API access that not every reader will have. A production system would run A/B evaluation with isolated indices.
+
+**`generate_embeddings.py` Bedrock support**: The offline embedding script currently hardcodes `LocalEmbeddingProvider`. Titan V2 embedding 5,470 hotels at 1 API call per hotel (no batch endpoint) would take ~100 API calls per batch, costing ~$0.05 at current Titan V2 pricing. The script is intentionally unchanged — the local provider is the right tool for offline index generation; Bedrock embedding is best reserved for the online `embed()` path (query embedding only), where one call per request is acceptable.
+
+### Results summary (M12)
+
+No new evaluation numbers — M12 is an infrastructure milestone. The quality improvement is latent: it is available when AWS credentials are present and `EMBEDDING_PROVIDER=bedrock`, `LLM_PROVIDER=bedrock`, or `RERANKER_PROVIDER=bedrock` are set.
+
+The measurable outcomes are:
+- 41 new unit tests, all passing, with zero real AWS calls
+- mypy strict mode passes on 49 source files (with `[[tool.mypy.overrides]]` for boto3/botocore)
+- `embedding_provider`, `reranker_provider` settings enable runtime provider switching without code changes
+- Graceful degradation verified: any Bedrock provider failure falls back to local silently
