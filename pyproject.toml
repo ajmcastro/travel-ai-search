@@ -3,6 +3,10 @@ name = "travel-ai-search"
 version = "0.1.0"
 description = "Educational project demonstrating modern AI search architectures for travel"
 readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Antonio Castro" }
+]
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",
