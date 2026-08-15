@@ -83,6 +83,16 @@ def get_rag_synthesizer(request: Request) -> object | None:
     return getattr(request.app.state, "rag_synthesizer", None)
 
 
+def get_destination_graph(request: Request) -> object | None:
+    """Return the shared DestinationGraph stored on app state, or None if not built.
+
+    The graph is None when graph_enabled=False in settings or when the knowledge
+    file could not be read at startup.  All /graph/* endpoints return HTTP 503
+    when this dependency resolves to None.
+    """
+    return getattr(request.app.state, "destination_graph", None)
+
+
 def get_settings() -> Settings:
     """Return the application settings singleton."""
     return _get_settings()

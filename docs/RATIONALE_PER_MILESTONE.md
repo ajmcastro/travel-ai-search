@@ -1519,3 +1519,44 @@ The key constraint from the project spec is preserved: **search remains the core
 - **Knowledge document freshness mechanism**: manual generation is sufficient for the educational scope.
 - **Semantic chunking of knowledge documents**: documents are short enough (one per island) that chunking adds no benefit.
 - **Knowledge evaluation metrics**: subjective quality of LLM synthesis is not measurable without human judgment labels.
+
+---
+
+## Milestone 14 — Graph-enhanced retrieval
+
+### Problem
+
+Vector search approximates similarity from text; it cannot express structural, curated facts about travel entities such as "Mallorca is editorially similar to Menorca" or "Glasgow airport does not operate long-haul flights to Barbados."  M14 adds a graph layer that encodes these structural facts deterministically, complementing the probabilistic nature of embedding search.
+
+### IR concept: property graph traversal
+
+A **property graph** represents entities as typed nodes and relationships as typed directed edges, each carrying metadata.  Traversal algorithms (BFS, DFS) explore the graph hop-by-hop, enabling queries that require multi-step reasoning over explicit links.
+
+In travel IR, this is valuable for two query classes:
+
+| Class | Example | Why graph beats vector |
+|---|---|---|
+| Curated similarity | "like Mallorca but quieter" → find Menorca | Editorial SIMILAR_TO edges are exact; embedding distance is approximate and depends on vocabulary overlap |
+| Structural reachability | "fly from Glasgow to..." → find valid destinations | Departure-airport reachability is a fact, not a semantic concept |
+
+**Contrast with collaborative filtering (CF):** CF also produces "similar entity" links, but derives them from behavioral co-occurrence (booking patterns).  SIMILAR_TO edges in this prototype are editorial (hand-curated in the knowledge base) — more reliable for small datasets, but less adaptive to actual user behavior.
+
+### Design decisions
+
+| Decision | Chosen | Rejected | Reason |
+|---|---|---|---|
+| Graph store | Pure Python in-memory (dict) | Neo4j, NetworkX, RDFLib | Dataset is tiny (38 nodes); no external dep needed; pure Python is readable and fully testable |
+| Edge directionality | Directed with bidirectional SIMILAR_TO (added both ways at build time) | Undirected graph | Directed graph is more general; FLIES_TO is naturally directed; SIMILAR_TO symmetric by convention, added bidirectionally at build time |
+| Similarity model | Curated editorial edges from `similar_destinations` field | Learned similarity (kNN over embeddings) | Knowledge docs already contain curated links; learning from 30 docs would overfit |
+| Airport model | Curated UK airports with realistic long-haul/short-haul split | Deriving airports from hotel `available_departure_airports` field | Hotel field is randomly assigned in synthetic data — not geographically meaningful; curated mapping is more educationally honest |
+| API surface | Three read-only GET endpoints under `/graph/*` | Adding `graph_expansion=true` to `POST /search` | Graph exploration first; integrating into the retrieval pipeline is M15+ territory |
+| Graph build trigger | Automatic at server startup from JSONL file | On-demand rebuild / DB-backed persistence | Graph is cheap to build (~1 ms); stateless rebuilds avoid cache invalidation problems |
+| Enum base | `StrEnum` | `str, Enum` | `StrEnum` is the modern Python 3.11+ preferred form (UP042); values serialise as plain strings in JSON |
+
+### What was not done and why
+
+- **Graph-boosted ranking**: would require multiplying edge weights with retrieval scores, affecting the pipeline under evaluation — added in M15 or as a future extension.
+- **Neo4j or other graph DB**: no clear learning value for 38 nodes; pure Python is more readable and self-contained.
+- **Weighted edges**: all edges are currently unweighted binary links. Weighting (e.g. similarity strength 0–1) is a natural extension.
+- **Hotel nodes in the graph**: would require re-reading the full hotel JSONL at startup; adds ~5,000 nodes without clear query-time benefit in this prototype.
+- **Reverse SIMILAR_TO index**: computed on-the-fly by scanning airport nodes in `GET /graph/airports` — acceptable for 8 airports, but would be pre-indexed for larger graphs.

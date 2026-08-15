@@ -110,6 +110,23 @@ generate-knowledge: ## Generate destination knowledge documents  [Milestone 13]
 ingest-knowledge: ## Create knowledge index and ingest destination docs  [Milestone 13]
 	uv run python scripts/ingest_knowledge.py
 
+# ── Graph exploration (Milestone 14) ───────────────────────────────────────────
+# The destination graph is built automatically at server startup from the
+# knowledge JSONL file — no separate ingestion step is required.
+# Use these curl examples to explore the graph endpoints after `make serve`:
+#
+#   Graph similarity (SIMILAR_TO traversal):
+#     curl "http://localhost:8000/graph/similar?destination=Mallorca&hops=1"
+#     curl "http://localhost:8000/graph/similar?destination=Mallorca&hops=2"
+#
+#   Reachable destinations from a departure airport (FLIES_TO traversal):
+#     curl "http://localhost:8000/graph/destinations?airport=GLA"
+#     curl "http://localhost:8000/graph/destinations?airport=LHR"
+#
+#   Airports serving a specific destination (reverse FLIES_TO lookup):
+#     curl "http://localhost:8000/graph/airports?destination=Barbados"
+#     curl "http://localhost:8000/graph/airports?destination=Tenerife"
+
 # ── Evaluation ─────────────────────────────────────────────────────────────────
 
 .PHONY: evaluate

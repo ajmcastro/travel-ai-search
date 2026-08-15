@@ -121,6 +121,15 @@ class Settings(BaseSettings):
     knowledge_index_name: str = "travel_destinations"
     rag_context_k: int = 3
 
+    # Graph-enhanced retrieval (Milestone 14)
+    # graph_enabled: set False to skip building the destination graph at startup.
+    #   When False, all /graph/* endpoints return HTTP 503.
+    # knowledge_file_path: path to the JSONL knowledge file used to seed the graph.
+    #   Relative paths are resolved from the working directory where the server starts.
+    #   The graph is rebuilt from this file on each server restart (no persistence needed).
+    graph_enabled: bool = True
+    knowledge_file_path: str = "data/knowledge/destinations.jsonl"
+
 
 @lru_cache
 def get_settings() -> Settings:

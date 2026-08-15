@@ -631,3 +631,60 @@ RAG synthesis quality depends on LLM availability (Bedrock credentials) and is i
 - Would a BM25 knowledge retrieval (term matching on destination name) outperform knn for exact-name queries ("tell me about Mallorca") while knn beats it for semantic queries ("somewhere like Mallorca but quieter")?
 - Could the knowledge documents be automatically refreshed from authoritative sources (Wikipedia infoboxes, travel authority data) rather than being manually curated?
 - M14 (graph-enhanced retrieval): could "similar_destinations" fields in knowledge documents seed a graph of destination similarity, enabling "travellers who liked Menorca also liked Corfu" style recommendations?
+
+---
+
+## Milestone 14 — Graph-enhanced retrieval
+
+### Concept
+
+Graph-enhanced retrieval augments vector and lexical search with structural, curated relationships between entities.  Where embeddings approximate similarity from text, a graph encodes exact, deterministic facts:
+
+- `Mallorca SIMILAR_TO Menorca` — editorial link, not embedding distance
+- `GLA FLIES_TO Tenerife` — structural reachability fact
+- `LGW FLIES_TO Barbados` (but `GLA` does not) — long-haul hub restriction
+
+### Hypothesis
+
+> Graph traversal can answer two classes of query that vector search cannot:
+> 1. **Curated similarity** — "similar destinations to Mallorca" where editorial links are more reliable than embedding proximity.
+> 2. **Structural reachability** — "which destinations can I fly to from Glasgow?" which has no meaningful embedding representation.
+
+### Implementation (no numeric evaluation)
+
+The destination graph is pure Python — an in-memory directed adjacency-list with 38 nodes (30 destinations + 8 UK airports) and ~200 edges.  No external graph database is used; the graph is rebuilt at startup from the knowledge JSONL file in milliseconds.
+
+**Edge types:**
+- `SIMILAR_TO` (bidirectional): seeded from `similar_destinations` in knowledge docs
+- `FLIES_TO` (directed, airport → destination): based on realistic UK charter routes; long-haul destinations (Barbados, Cancún, Maldives, Phuket, Koh Samui) restricted to hub airports (LGW, LHR, MAN)
+
+**Key observation — similarity vs. embedding:**
+
+| Query | Vector search result | Graph traversal result |
+|---|---|---|
+| "Similar to Mallorca" | Ibiza (textually similar) | Ibiza, Menorca (curated) |
+| "Similar to Mallorca, 2 hops" | Not meaningful | Ibiza, Menorca, plus destinations similar to those |
+| "Fly from Glasgow" | No meaningful result | 25 Mediterranean/Canary destinations (excludes 5 long-haul) |
+| "Fly from Gatwick" | No meaningful result | All 30 destinations |
+
+**What the graph cannot do:**
+- Score or rank (no weights on edges in this prototype)
+- Generalise from learned patterns (no embedding, no ML)
+- Recover from missing edges (if an editorial link is absent, traversal misses it)
+
+This illustrates the complementary nature of the two approaches: vector search finds semantically related content it was never explicitly told about; graph traversal follows exact facts that embeddings cannot encode.
+
+### Experiments to run manually
+
+1. **Similarity depth comparison**: Call `/graph/similar?destination=Mallorca&hops=1` then `hops=2`. Observe how the 2-hop result discovers "second-degree" destinations (similar to something similar to Mallorca) — a chain that would require iterative embedding queries to replicate.
+
+2. **Hub vs. regional airport**: Compare `/graph/destinations?airport=GLA` with `/graph/destinations?airport=LHR`. Glasgow returns ~25 (short-haul only); Heathrow returns all 30. Try `/graph/airports?destination=Barbados` to confirm only 3 airports serve it.
+
+3. **Graph vs. vector for "like X"**: Submit `POST /search` with `{"query": "somewhere like Mallorca but quieter", "rag": false}`. Note which destinations appear. Then call `/graph/similar?destination=Mallorca&hops=1` and compare the overlap. The graph may surface Menorca more reliably if Ibiza's popular-nightlife description dominates the embedding distance.
+
+### Next questions this raises
+
+- Should SIMILAR_TO edges carry weights (strength of similarity) rather than being binary?
+- Could the graph be built from behavioral data (booking co-occurrence) rather than editorial curation, making it more like collaborative filtering?
+- Would a sparse matrix representation of the graph enable efficient batch scoring — multiplying hotel relevance scores by destination similarity to produce "graph-boosted" ranking?
+- In a production system, how would you keep editorial similarity links fresh without a full re-ingest cycle?

@@ -9,6 +9,7 @@ Resources created once at startup and stored on app.state:
   query_expander             — query expander for multi-query retrieval (None when disabled)
   knowledge_retriever        — RAG knowledge retriever (None when rag_enabled=False)
   rag_synthesizer            — RAG LLM synthesizer (None when rag_enabled=False)
+  destination_graph          — in-memory travel graph (None when graph_enabled=False)
 
 All route handlers receive these via dependency functions in deps.py.
 """
@@ -21,6 +22,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from travel_ai_search.api.routes import graph as graph_router
 from travel_ai_search.api.routes import query as query_router
 from travel_ai_search.api.routes import search as search_router
 from travel_ai_search.config.settings import Settings, get_settings
@@ -194,6 +196,37 @@ def _create_knowledge_retriever(
         return None
 
 
+def _create_destination_graph(settings: Settings) -> object | None:
+    """Factory — returns None when graph_enabled=False or the knowledge file is missing.
+
+    The graph is built entirely from the local JSONL file — no OpenSearch required.
+    Graceful degradation: a missing file or parse error logs a warning and all
+    /graph/* endpoints return HTTP 503 for this server instance.
+    """
+    if not settings.graph_enabled:
+        return None
+    try:
+        from pathlib import Path
+
+        from travel_ai_search.graph.builder import build_destination_graph, load_knowledge_docs
+
+        docs = load_knowledge_docs(Path(settings.knowledge_file_path))
+        graph = build_destination_graph(docs)
+        logger.info(
+            "Destination graph ready: %d nodes, %d edges.",
+            graph.node_count(),
+            graph.edge_count(),
+        )
+        return graph
+    except Exception as exc:
+        logger.warning(
+            "Failed to build destination graph from '%s': %s — /graph/* endpoints disabled.",
+            settings.knowledge_file_path,
+            exc,
+        )
+        return None
+
+
 def _create_rag_synthesizer(settings: Settings) -> object | None:
     """Factory — returns None when rag_enabled=False or the LLM fails to initialise.
 
@@ -250,6 +283,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.embedding_provider,
     )
     app.state.rag_synthesizer = _create_rag_synthesizer(settings)
+    app.state.destination_graph = _create_destination_graph(settings)
     yield
     app.state.os_client.close()
 
@@ -263,6 +297,7 @@ app = FastAPI(
 
 app.include_router(search_router.router, prefix="/search")
 app.include_router(query_router.router, prefix="/query")
+app.include_router(graph_router.router, prefix="/graph")
 
 
 @app.get("/health", tags=["Health"])

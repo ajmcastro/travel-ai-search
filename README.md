@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 13 — RAG / travel knowledge base
+## Current status: Milestone 14 — Graph-enhanced retrieval
 
 | # | Milestone | Status |
 |---|---|---|
@@ -23,8 +23,8 @@ An educational, production-quality project demonstrating modern AI search archit
 | 10 | Query rewriting | ✅ Complete |
 | 11 | Multi-query retrieval | ✅ Complete |
 | 12 | AWS Bedrock providers | ✅ Complete |
-| 13 | RAG / travel knowledge base | ✅ **Complete** |
-| 14 | Graph-enhanced retrieval prototype | Pending |
+| 13 | RAG / travel knowledge base | ✅ Complete |
+| 14 | Graph-enhanced retrieval prototype | ✅ **Complete** |
 | 15 | Production API, observability, resilience | Pending |
 
 ### BM25 vs Vector vs Hybrid vs RRF vs Rerank vs Understand vs Rewrite vs Expand (K=10, 62 queries, 10 query classes)
@@ -48,6 +48,7 @@ An educational, production-quality project demonstrating modern AI search archit
 - Expand (M11) — QU + `LocalQueryExpander` (N=3 variants) + 6-list RRF: beats rewrite on NDCG (0.629 vs 0.613) because the original query is preserved as the first variant. `activities` +20.9%, `budget` +21.1% (vocabulary mismatch classes benefit most). Cost: 4× latency (180 ms) due to sequential retrieval. `adults_couples` −16.8% (hard constraint filtering is more effective than expansion for this class). Architecture in place for LLM-generated diverse expansion variants (M12).
 - Bedrock (M12) — `BedrockEmbeddingProvider` (Titan V2), `BedrockLLMProvider` (Claude via Converse API), `BedrockReranker` (Cohere Rerank v3.5): all three provider slots now support AWS Bedrock as a drop-in replacement for local providers. Activated via `EMBEDDING_PROVIDER=bedrock`, `LLM_PROVIDER=bedrock`, `RERANKER_PROVIDER=bedrock`. Graceful degradation: any Bedrock initialisation failure logs a warning and falls back to local. AWS credentials are never required to run the system.
 - RAG (M13) — destination knowledge base: 30 documents (one per island/region), stored in a separate `travel_destinations` OpenSearch index and retrieved semantically alongside hotel search. `POST /search` with `rag=true` returns `knowledge_context` (structured destination facts) and optionally `rag_summary` (LLM-synthesized recommendation). Hotel ranking is unchanged — RAG is purely additive. Demonstrates the core distinction between product retrieval (rank hotels) and knowledge retrieval (explain destinations). Country pre-filter from QU prevents cross-country semantic leakage.
+- Graph (M14) — in-memory destination graph: 38 nodes (30 destinations + 8 UK airports) and ~200 edges built from the knowledge JSONL at startup. Two edge types: `SIMILAR_TO` (curated editorial similarity, bidirectional) and `FLIES_TO` (directed, airport → destination, with realistic long-haul hub restriction). Three exploration endpoints: `GET /graph/similar` (BFS SIMILAR_TO), `GET /graph/destinations` (FLIES_TO from airport), `GET /graph/airports` (reverse FLIES_TO). Demonstrates what graph traversal provides that vector search cannot: exact structural reachability and multi-hop curated similarity chains.
 
 Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
@@ -237,6 +238,21 @@ curl -X POST "localhost:8000/search" \
 curl -X POST "localhost:8000/search" \
   -H "Content-Type: application/json" \
   -d '{"query": "relaxed beach holiday in Greece", "rag": true}'
+
+# Graph exploration: curated SIMILAR_TO traversal (Milestone 14)
+# No extra setup needed — graph is built at startup (GRAPH_ENABLED=true by default)
+curl "localhost:8000/graph/similar?destination=Mallorca&hops=1"
+curl "localhost:8000/graph/similar?destination=Mallorca&hops=2"
+
+# Graph exploration: airport → reachable destinations (FLIES_TO edges)
+# Compare GLA (regional, short-haul only) vs LHR (hub, includes long-haul)
+curl "localhost:8000/graph/destinations?airport=GLA"
+curl "localhost:8000/graph/destinations?airport=LHR"
+
+# Graph exploration: which airports serve a long-haul destination?
+# Barbados → only LGW, LHR, MAN; Tenerife → all 8 UK airports
+curl "localhost:8000/graph/airports?destination=Barbados"
+curl "localhost:8000/graph/airports?destination=Tenerife"
 ```
 
 Response shape:
@@ -342,6 +358,8 @@ Copy `.env.example` to `.env` (or run `make env`) and adjust as needed. All sett
 | `RAG_ENABLED` | `false` | Enable knowledge retrieval + synthesis at startup (set `true` after `make ingest-knowledge`) |
 | `KNOWLEDGE_INDEX_NAME` | `travel_destinations` | OpenSearch index for destination knowledge documents |
 | `RAG_CONTEXT_K` | `3` | Number of destination knowledge docs to retrieve per RAG query |
+| `GRAPH_ENABLED` | `true` | Build in-memory destination graph at startup (set `false` to disable `/graph/*` endpoints) |
+| `KNOWLEDGE_FILE_PATH` | `data/knowledge/destinations.jsonl` | JSONL file used to seed the destination graph |
 
 ---
 
@@ -354,7 +372,8 @@ src/travel_ai_search/
 │   ├── deps.py              # FastAPI dependency injection
 │   └── routes/
 │       ├── search.py        # GET /search/lexical, GET /search/vector, POST /search
-│       └── query.py         # POST /query/understand
+│       ├── query.py         # POST /query/understand
+│       └── graph.py         # GET /graph/similar, GET /graph/destinations, GET /graph/airports (M14)
 ├── config/
 │   └── settings.py          # Pydantic settings, loaded from env vars / .env
 ├── domain/
@@ -395,6 +414,10 @@ src/travel_ai_search/
 │   ├── index.py             # Knowledge index mapping, create_knowledge_index()
 │   ├── retriever.py         # KnowledgeRetriever (knn + optional country filter)
 │   └── synthesizer.py       # RAGSynthesizer (prompt construction + LLM call)
+├── graph/                   # Graph-enhanced retrieval (M14)
+│   ├── __init__.py
+│   ├── models.py            # NodeType, EdgeType, GraphNode, DestinationGraph (adjacency-list)
+│   └── builder.py           # build_destination_graph(), load_knowledge_docs()
 └── infrastructure/
     ├── opensearch.py        # OpenSearch client factory
     └── bedrock.py           # boto3 bedrock-runtime client factory (M12)
@@ -420,7 +443,7 @@ data/
     └── results/             # JSON evaluation results per run
 
 tests/
-├── unit/                    # No infrastructure required (459 tests)
+├── unit/                    # No infrastructure required (498 tests)
 └── integration/             # Requires OpenSearch running (132 tests)
 ```
 
