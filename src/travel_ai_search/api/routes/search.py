@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from fastapi import APIRouter, Depends, Query
 from opensearchpy import OpenSearch
@@ -29,12 +30,17 @@ from travel_ai_search.api.schemas.search import (
 )
 from travel_ai_search.config.settings import Settings
 from travel_ai_search.embeddings.base import EmbeddingProvider
+from travel_ai_search.observability.metrics import (
+    search_fallbacks_total,
+    search_latency_ms,
+    search_requests_total,
+)
 from travel_ai_search.query_understanding.base import QueryUnderstandingEngine
 from travel_ai_search.query_understanding.expander import QueryExpander
 from travel_ai_search.query_understanding.rewriter import QueryRewriter
 from travel_ai_search.reranking.base import Reranker
 from travel_ai_search.retrieval.fusion import FusionMethod
-from travel_ai_search.retrieval.hybrid import HybridSearchParams, hybrid_search
+from travel_ai_search.retrieval.hybrid import HybridSearchParams, HybridSearchResult, hybrid_search
 from travel_ai_search.retrieval.lexical import LexicalSearchParams, lexical_search
 from travel_ai_search.retrieval.multi_query import multi_query_search
 from travel_ai_search.retrieval.vector import VectorSearchParams, vector_search
@@ -242,16 +248,32 @@ def full_search_endpoint(
         POST /search
         {"query": "quiet luxury spa retreat", "expand": true, "n_queries": 3}
     """
+    _t_start = time.perf_counter()
+
+    # ── Stage 1: Query understanding ──────────────────────────────────────
+    _t_qu = time.perf_counter()
     qu = qu_engine.understand(body.query)
+    qu_took_ms = round((time.perf_counter() - _t_qu) * 1_000)
     qu_response = QueryUnderstandResponse.from_understanding(qu)
 
-    # Optional query rewriting: expand the semantic query using the LLM provider.
+    # ── Stage 2: Optional query rewriting ────────────────────────────────
+    # Graceful degradation: if the rewriter raises at runtime (e.g. LLM
+    # timeout) we log a warning and continue with the original semantic query.
     rewritten_query: str | None = None
     retrieval_query = qu.semantic_query
+    rewrite_took_ms = 0
     if body.rewrite and query_rewriter is not None:
-        rewritten_query = query_rewriter.rewrite(qu.semantic_query)
-        retrieval_query = rewritten_query
+        _t_rw = time.perf_counter()
+        try:
+            rewritten_query = query_rewriter.rewrite(qu.semantic_query)
+            retrieval_query = rewritten_query
+        except Exception as exc:
+            logger.warning(
+                "Query rewriting failed at runtime: %s — using original semantic query.", exc
+            )
+        rewrite_took_ms = round((time.perf_counter() - _t_rw) * 1_000)
 
+    # ── Stage 3: Retrieval ────────────────────────────────────────────────
     candidate_k = body.candidate_k if body.candidate_k is not None else settings.hybrid_candidate_k
     rerank_k = body.rerank_k if body.rerank_k is not None else settings.rerank_k
 
@@ -266,36 +288,67 @@ def full_search_endpoint(
     )
     active_reranker = loaded_reranker if body.rerank else None
 
-    # Optional multi-query expansion: generate N variants and fuse all rank lists.
+    # Determine planned strategy label (used for metrics and response field).
+    strategy = "multi_query" if (body.expand and query_expander is not None) else "hybrid"
+    fallback_used = False
+
     expanded_queries: list[str] | None = None
-    if body.expand and query_expander is not None:
-        n_queries = max(1, body.n_queries)
-        expanded_queries = query_expander.expand(retrieval_query, n_queries)
-        result = multi_query_search(
-            client,
-            provider,
-            params,
-            expanded_queries,
-            index=settings.opensearch_index_name,
-            reranker=active_reranker,
+    try:
+        if body.expand and query_expander is not None:
+            n_queries = max(1, body.n_queries)
+            expanded_queries = query_expander.expand(retrieval_query, n_queries)
+            result = multi_query_search(
+                client,
+                provider,
+                params,
+                expanded_queries,
+                index=settings.opensearch_index_name,
+                reranker=active_reranker,
+            )
+        else:
+            result = hybrid_search(
+                client,
+                provider,
+                params,
+                index=settings.opensearch_index_name,
+                reranker=active_reranker,
+            )
+    except Exception as exc:
+        # Graceful degradation: if vector embedding fails (or any other
+        # unrecoverable error in hybrid search) fall back to BM25 lexical
+        # retrieval so the request still returns useful results.
+        logger.warning(
+            "Hybrid/vector retrieval failed: %s — falling back to BM25 (lexical_fallback).", exc
         )
-    else:
-        result = hybrid_search(
-            client,
-            provider,
-            params,
-            index=settings.opensearch_index_name,
-            reranker=active_reranker,
+        fallback_used = True
+        strategy = "lexical_fallback"
+        search_fallbacks_total.inc({"reason": "embedding_failure"})
+
+        lex_params = LexicalSearchParams(
+            query=retrieval_query,
+            top_k=body.top_k,
+            **qu.to_search_filters(),
+        )
+        lex_result = lexical_search(client, lex_params, index=settings.opensearch_index_name)
+        result = HybridSearchResult(
+            hits=lex_result.hits,
+            total=lex_result.total,
+            took_ms=lex_result.took_ms,
+            lexical_took_ms=lex_result.took_ms,
+            vector_took_ms=0,
+            reranking_took_ms=0,
         )
 
-    # Optional RAG: knowledge retrieval + LLM synthesis.
+    # ── Stage 4: Optional RAG ─────────────────────────────────────────────
     # Runs after hotel retrieval so it does not affect hotel ranking.
     knowledge_context: list[DestinationContextItem] | None = None
     rag_summary: str | None = None
+    rag_took_ms = 0
     if body.rag and knowledge_retriever is not None:
         from travel_ai_search.rag.knowledge import DestinationKnowledge
         from travel_ai_search.rag.retriever import KnowledgeRetriever
 
+        _t_rag = time.perf_counter()
         raw_knowledge: list[DestinationKnowledge] = []
         try:
             retriever: KnowledgeRetriever = knowledge_retriever  # type: ignore[assignment]
@@ -316,9 +369,52 @@ def full_search_endpoint(
             except Exception as exc:
                 logger.warning("RAG synthesis failed: %s — returning knowledge context only.", exc)
 
+        rag_took_ms = round((time.perf_counter() - _t_rag) * 1_000)
+
+    # ── Observability ─────────────────────────────────────────────────────
+    total_took_ms = round((time.perf_counter() - _t_start) * 1_000)
+
+    search_requests_total.inc({"strategy": strategy})
+    search_latency_ms.observe(total_took_ms)
+
+    logger.info(
+        "search_request_completed",
+        extra={
+            "query": body.query,
+            "strategy": strategy,
+            "result_count": len(result.hits),
+            "total_took_ms": total_took_ms,
+            "qu_took_ms": qu_took_ms,
+            "rewrite_took_ms": rewrite_took_ms,
+            "lexical_took_ms": result.lexical_took_ms,
+            "vector_took_ms": result.vector_took_ms,
+            "reranking_took_ms": result.reranking_took_ms,
+            "rag_took_ms": rag_took_ms,
+            "fallback_used": fallback_used,
+            "rewritten": rewritten_query is not None,
+            "expanded": expanded_queries is not None,
+        },
+    )
+
+    # Patch the result's took_ms to reflect the full end-to-end wall-clock time
+    # (hybrid_search's own took_ms only covers the retrieval stage).
+    result = HybridSearchResult(
+        hits=result.hits,
+        total=result.total,
+        took_ms=total_took_ms,
+        lexical_took_ms=result.lexical_took_ms,
+        vector_took_ms=result.vector_took_ms,
+        reranking_took_ms=result.reranking_took_ms,
+    )
+
     return FullSearchResponse.from_result(
         result,
         qu_response,
+        qu_took_ms=qu_took_ms,
+        rewrite_took_ms=rewrite_took_ms,
+        rag_took_ms=rag_took_ms,
+        strategy=strategy,
+        fallback_used=fallback_used,
         rewritten_query=rewritten_query,
         expanded_queries=expanded_queries,
         knowledge_context=knowledge_context,

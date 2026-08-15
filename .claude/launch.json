@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "travel-ai-search",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "uvicorn", "travel_ai_search.api.app:app", "--port", "8765"],
+      "port": 8765
+    }
+  ]
+}

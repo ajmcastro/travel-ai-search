@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 14 — Graph-enhanced retrieval
+## Current status: Milestone 15 — Production API, observability, resilience ✅ Complete
 
 | # | Milestone | Status |
 |---|---|---|
@@ -24,31 +24,32 @@ An educational, production-quality project demonstrating modern AI search archit
 | 11 | Multi-query retrieval | ✅ Complete |
 | 12 | AWS Bedrock providers | ✅ Complete |
 | 13 | RAG / travel knowledge base | ✅ Complete |
-| 14 | Graph-enhanced retrieval prototype | ✅ **Complete** |
-| 15 | Production API, observability, resilience | Pending |
+| 14 | Graph-enhanced retrieval prototype | ✅ Complete |
+| 15 | Production API, observability, resilience, final evaluation | ✅ **Complete** |
 
-### BM25 vs Vector vs Hybrid vs RRF vs Rerank vs Understand vs Rewrite vs Expand (K=10, 62 queries, 10 query classes)
+### Final evaluation results — BM25 vs Vector vs RRF vs Rerank vs Understand vs Rewrite vs Expand (K=10, 62 queries, 10 query classes)
 
-| Metric | BM25 | Vector | Hybrid | RRF | Rerank | Understand | Rewrite | **Expand** |
-|---|---|---|---|---|---|---|---|---|
-| NDCG@10 | 0.5007 | 0.6940 | 0.6003 | 0.6239 | **0.6830** | 0.6312 | 0.6130 | 0.6285 |
-| MRR | 0.6842 | 0.8688 | 0.8542 | 0.8449 | 0.8191 | **0.8620** | 0.8226 | 0.8308 |
-| HitRate@10 | 0.8226 | **1.0000** | 0.9355 | 0.9516 | 0.9516 | 0.9355 | **0.9677** | 0.9516 |
-| Precision@10 | 0.6145 | 0.7790 | 0.6823 | 0.7210 | **0.7935** | 0.7290 | 0.7242 | 0.7226 |
-| Latency p50 | 24 ms | 11 ms | 57 ms | 56 ms | 113 ms | **45 ms** | 54 ms | 180 ms |
-| Latency p95 | 45 ms | 135 ms | 90 ms | 84 ms | 142 ms | **71 ms** | 98 ms | 236 ms |
+| Metric | BM25 | **Vector** | RRF | Rerank | Understand | Rewrite | Expand |
+|---|---|---|---|---|---|---|---|
+| NDCG@10 | 0.5021 | **0.6940** | 0.6239 | 0.6830 | 0.6312 | 0.6130 | 0.6285 |
+| MRR | 0.6874 | **0.8688** | 0.8449 | 0.8191 | 0.8620 | 0.8226 | 0.8308 |
+| HitRate@10 | 0.8387 | **1.0000** | 0.9516 | 0.9516 | 0.9355 | 0.9677 | 0.9516 |
+| Precision@10 | 0.6161 | 0.7790 | 0.7210 | **0.8935** | 0.7290 | 0.7242 | 0.7226 |
+| Latency p50 | 26 ms | **10 ms** | 50 ms | 109 ms | 46 ms | 56 ms | 167 ms |
+| Latency p95 | 46 ms | 292 ms | 86 ms | 178 ms | 75 ms | 126 ms | 218 ms |
 
 **Key findings (cumulative):**
 - Vector (M5): NDCG +38.6% vs BM25; `exact_destination` NDCG jumped from 0.18 → 0.84 (+358%); HitRate = 1.000.
 - Hybrid (M6) — weighted sum, 50/50: overall NDCG is between BM25 and vector (0.60). Naive 50/50 fusion can *regress* from the best individual retriever when one retriever produces meaningless scores for a query class. `exact_destination` NDCG drops from 0.84 (vector) to 0.48.
 - Hybrid (M7) — RRF (k=60): beats weighted-sum (+3.9% NDCG, +5.7% Precision) by using rank positions instead of raw scores. `exact_destination` recovers from 0.48 to 0.53; `activities` beats vector (0.40 vs 0.38). Still below pure vector overall.
-- Rerank (M8) — RRF + cross-encoder (`ms-marco-MiniLM-L-6-v2`, 50 candidates): **highest NDCG overall (0.683)**. `exact_destination` jumps from 0.53 to 0.79 (+48%); `activities` from 0.40 to 0.57 (+43%). Cost: ~57 ms extra latency.
-- Understand (M9) — rule-based QU + RRF: beats RRF on NDCG (+1.2%) and MRR (+2.0%) while being **20% faster** (45 ms vs 56 ms p50). `adults_couples` NDCG +8.9% (correct `adults_only` filter extracted). Main failure: false-positive constraints on `budget` queries (−18.4%).
-- Rewrite (M10) — QU + `LocalLLMProvider` keyword expansion + RRF: **HitRate improves +3.4%** (more relevant hotels in top-10) but NDCG and MRR regress vs Understand (−2.9%, −4.6%). Classic precision-recall tradeoff: naive synonym expansion broadens recall but dilutes the ranking signal. `activities` class +14.4%. Architecture ready for real LLM (M12).
-- Expand (M11) — QU + `LocalQueryExpander` (N=3 variants) + 6-list RRF: beats rewrite on NDCG (0.629 vs 0.613) because the original query is preserved as the first variant. `activities` +20.9%, `budget` +21.1% (vocabulary mismatch classes benefit most). Cost: 4× latency (180 ms) due to sequential retrieval. `adults_couples` −16.8% (hard constraint filtering is more effective than expansion for this class). Architecture in place for LLM-generated diverse expansion variants (M12).
-- Bedrock (M12) — `BedrockEmbeddingProvider` (Titan V2), `BedrockLLMProvider` (Claude via Converse API), `BedrockReranker` (Cohere Rerank v3.5): all three provider slots now support AWS Bedrock as a drop-in replacement for local providers. Activated via `EMBEDDING_PROVIDER=bedrock`, `LLM_PROVIDER=bedrock`, `RERANKER_PROVIDER=bedrock`. Graceful degradation: any Bedrock initialisation failure logs a warning and falls back to local. AWS credentials are never required to run the system.
-- RAG (M13) — destination knowledge base: 30 documents (one per island/region), stored in a separate `travel_destinations` OpenSearch index and retrieved semantically alongside hotel search. `POST /search` with `rag=true` returns `knowledge_context` (structured destination facts) and optionally `rag_summary` (LLM-synthesized recommendation). Hotel ranking is unchanged — RAG is purely additive. Demonstrates the core distinction between product retrieval (rank hotels) and knowledge retrieval (explain destinations). Country pre-filter from QU prevents cross-country semantic leakage.
-- Graph (M14) — in-memory destination graph: 38 nodes (30 destinations + 8 UK airports) and ~200 edges built from the knowledge JSONL at startup. Two edge types: `SIMILAR_TO` (curated editorial similarity, bidirectional) and `FLIES_TO` (directed, airport → destination, with realistic long-haul hub restriction). Three exploration endpoints: `GET /graph/similar` (BFS SIMILAR_TO), `GET /graph/destinations` (FLIES_TO from airport), `GET /graph/airports` (reverse FLIES_TO). Demonstrates what graph traversal provides that vector search cannot: exact structural reachability and multi-hop curated similarity chains.
+- Rerank (M8) — RRF + cross-encoder (`ms-marco-MiniLM-L-6-v2`, 50 candidates): **highest Precision@10 overall (0.89)**. `exact_destination` jumps from 0.53 to 0.79 (+48%); `activities` from 0.40 to 0.57 (+43%). Cost: ~83 ms extra latency.
+- Understand (M9) — rule-based QU + RRF: beats RRF on NDCG (+1.2%) and MRR (+2.0%) while being **8.7% faster** (46 ms vs 50 ms p50). `adults_couples` NDCG +8.9% (correct `adults_only` filter extracted). Main failure: false-positive constraints on `budget` queries (−18.4%).
+- Rewrite (M10) — QU + `LocalLLMProvider` keyword expansion + RRF: **HitRate improves +3.4%** (more relevant hotels in top-10) but NDCG and MRR regress vs Understand (−2.9%, −4.6%). Classic precision-recall tradeoff: naive synonym expansion broadens recall but dilutes the ranking signal. Architecture ready for real LLM (M12).
+- Expand (M11) — QU + `LocalQueryExpander` (N=3 variants) + 6-list RRF: beats rewrite on NDCG (0.629 vs 0.613) because the original query is preserved as the first variant. `activities` +20.9%, `budget` +21.1%. Cost: 3.6× latency (167 ms). Architecture in place for LLM-generated diverse expansion variants (M12).
+- Bedrock (M12) — `BedrockEmbeddingProvider` (Titan V2), `BedrockLLMProvider` (Claude via Converse API), `BedrockReranker` (Cohere Rerank v3.5): all three provider slots now support AWS Bedrock as a drop-in replacement for local providers. Graceful degradation: any Bedrock initialisation failure logs a warning and falls back to local. AWS credentials are never required to run the system.
+- RAG (M13) — destination knowledge base: 30 documents (one per island/region), stored in a separate `travel_destinations` OpenSearch index and retrieved semantically alongside hotel search. `POST /search` with `rag=true` returns `knowledge_context` (structured destination facts) and optionally `rag_summary` (LLM-synthesized recommendation). Hotel ranking is unchanged — RAG is purely additive.
+- Graph (M14) — in-memory destination graph: 38 nodes (30 destinations + 8 UK airports) and 309 edges built from the knowledge JSONL at startup. Two edge types: `SIMILAR_TO` (curated editorial similarity, bidirectional) and `FLIES_TO` (directed, airport → destination, with realistic long-haul hub restriction). Three exploration endpoints: `GET /graph/similar` (BFS SIMILAR_TO), `GET /graph/destinations` (FLIES_TO from airport), `GET /graph/airports` (reverse FLIES_TO). Demonstrates what graph traversal provides that vector search cannot: exact structural reachability and multi-hop curated similarity chains.
+- Observability (M15) — per-stage pipeline timing (`qu_took_ms`, `rewrite_took_ms`, `lexical_took_ms`, `vector_took_ms`, `reranking_took_ms`, `rag_took_ms`), structured request logging, in-memory Prometheus-compatible metrics (`GET /metrics`), deep health check (`GET /health`), and runtime resilience (rewriter fail → original query; embedding fail → BM25 fallback). 9 new resilience unit tests verify all fallback paths.
 
 Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
@@ -184,7 +185,8 @@ Available endpoints:
 
 | Endpoint | Description |
 |---|---|
-| `GET /health` | OpenSearch connectivity check |
+| `GET /health` | Deep health check: OpenSearch ping, index existence, model load states |
+| `GET /metrics` | Prometheus-compatible counters and histograms (request counts, latency) |
 | `GET /search/lexical?q=...` | BM25 lexical search |
 | `GET /search/vector?q=...` | Dense vector (ANN) search |
 | `GET /search/hybrid?q=...` | Hybrid BM25 + vector (weighted-sum or RRF fusion) |
@@ -253,6 +255,19 @@ curl "localhost:8000/graph/destinations?airport=LHR"
 # Barbados → only LGW, LHR, MAN; Tenerife → all 8 UK airports
 curl "localhost:8000/graph/airports?destination=Barbados"
 curl "localhost:8000/graph/airports?destination=Tenerife"
+
+# Deep health check (Milestone 15) — shows component status, not just "ok"
+curl "localhost:8000/health"
+
+# Prometheus metrics scrape — counters, latency histogram in text exposition format
+curl "localhost:8000/metrics"
+
+# Full search with complete per-stage timing in response (Milestone 15)
+# Response now includes: qu_took_ms, rewrite_took_ms, lexical_took_ms,
+# vector_took_ms, reranking_took_ms, rag_took_ms, strategy, fallback_used
+curl -X POST "localhost:8000/search" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "family beach holiday Greece July from Manchester"}'
 ```
 
 Response shape:
@@ -319,6 +334,7 @@ make fmt                # ruff format
 make typecheck          # mypy
 make serve              # FastAPI dev server
 make evaluate           # run BM25 evaluation against golden dataset
+make final-eval         # run final evaluation across all strategies + save results (Milestone 15)
 make generate-embeddings # generate dense embeddings for all hotels (Milestone 5+)
 ```
 
@@ -337,6 +353,7 @@ Copy `.env.example` to `.env` (or run `make env`) and adjust as needed. All sett
 | `OPENSEARCH_INDEX_NAME` | `travel_hotels` | Index name (override for staging/test) |
 | `TOP_K` | `10` | Default result count for search and evaluation |
 | `LOG_LEVEL` | `INFO` | Application log level |
+| `LOG_FORMAT` | `text` | Log format: `text` (human-readable) or `json` (NDJSON for production log aggregators) |
 | `ENVIRONMENT` | `development` | `development` or `production` |
 | `EMBEDDING_MODEL_NAME` | `all-MiniLM-L6-v2` | Sentence-transformers model for dense embeddings |
 | `EMBEDDING_DIMENSION` | `384` | Embedding dimension (must match model and index mapping) |
@@ -373,6 +390,7 @@ src/travel_ai_search/
 │   └── routes/
 │       ├── search.py        # GET /search/lexical, GET /search/vector, POST /search
 │       ├── query.py         # POST /query/understand
+│       ├── health.py        # GET /health — deep health check (M15)
 │       └── graph.py         # GET /graph/similar, GET /graph/destinations, GET /graph/airports (M14)
 ├── config/
 │   └── settings.py          # Pydantic settings, loaded from env vars / .env
@@ -418,6 +436,9 @@ src/travel_ai_search/
 │   ├── __init__.py
 │   ├── models.py            # NodeType, EdgeType, GraphNode, DestinationGraph (adjacency-list)
 │   └── builder.py           # build_destination_graph(), load_knowledge_docs()
+├── observability/           # Observability utilities (M15)
+│   ├── metrics.py           # Counter, Histogram, MetricsRegistry — Prometheus text format
+│   └── logging.py           # StructuredFormatter — NDJSON log format (LOG_FORMAT=json)
 └── infrastructure/
     ├── opensearch.py        # OpenSearch client factory
     └── bedrock.py           # boto3 bedrock-runtime client factory (M12)
@@ -443,7 +464,7 @@ data/
     └── results/             # JSON evaluation results per run
 
 tests/
-├── unit/                    # No infrastructure required (498 tests)
+├── unit/                    # No infrastructure required (525 tests)
 └── integration/             # Requires OpenSearch running (132 tests)
 ```
 

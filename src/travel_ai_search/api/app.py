@@ -23,6 +23,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from travel_ai_search.api.routes import graph as graph_router
+from travel_ai_search.api.routes import health as health_router
 from travel_ai_search.api.routes import query as query_router
 from travel_ai_search.api.routes import search as search_router
 from travel_ai_search.config.settings import Settings, get_settings
@@ -40,15 +41,20 @@ from travel_ai_search.reranking.base import Reranker
 # Uvicorn's dictConfig only configures uvicorn.* loggers and leaves the root
 # logger without a handler.  Records that propagate from travel_ai_search.*
 # loggers reach Python's "handler of last resort" (level=WARNING), so INFO
-# messages are silently dropped without the two lines below.
+# messages are silently dropped without the lines below.
 #
-# logging.basicConfig() adds a StreamHandler to the root logger only when it
-# has no handlers yet — a no-op if any other setup (e.g. test runners) has
-# already installed one.  We then set the travel_ai_search namespace to the
-# configured level so that all application loggers respect log_level without
-# changing uvicorn's verbosity (controlled separately via --log-level).
-logging.basicConfig(format="%(levelname)s:%(name)s: %(message)s")
-logging.getLogger("travel_ai_search").setLevel(get_settings().log_level.upper())
+# When LOG_FORMAT=json, StructuredFormatter replaces the plain-text handler so
+# that every travel_ai_search.* record is emitted as one line of NDJSON — ideal
+# for log aggregation systems (Loki, CloudWatch, Splunk).  Otherwise a simple
+# human-readable format is used for local development.
+_settings_for_logging = get_settings()
+if _settings_for_logging.log_format.lower() == "json":
+    from travel_ai_search.observability.logging import configure_structured_logging
+
+    configure_structured_logging("travel_ai_search", _settings_for_logging.log_level)
+else:
+    logging.basicConfig(format="%(levelname)s:%(name)s: %(message)s")
+    logging.getLogger("travel_ai_search").setLevel(_settings_for_logging.log_level.upper())
 
 logger = logging.getLogger(__name__)
 
@@ -313,9 +319,24 @@ app = FastAPI(
 app.include_router(search_router.router, prefix="/search")
 app.include_router(query_router.router, prefix="/query")
 app.include_router(graph_router.router, prefix="/graph")
+app.include_router(health_router.router, prefix="/health")
 
 
-@app.get("/health", tags=["Health"])
-def health() -> dict[str, str]:
-    """Return API health status."""
-    return {"status": "ok"}
+@app.get("/metrics", tags=["Observability"], include_in_schema=False)
+def metrics_endpoint() -> object:
+    """Expose in-memory counters and histograms in Prometheus text format.
+
+    Prometheus (or any compatible scraper) should poll this endpoint on a
+    regular interval (e.g. every 15 s) to collect:
+      travel_search_requests_total{strategy=...}   — request counts by strategy
+      travel_search_latency_ms_bucket{le=...}      — latency distribution
+      travel_search_fallbacks_total{reason=...}    — degradation events
+
+    Example (manual scrape):
+        curl http://localhost:8000/metrics
+    """
+    from fastapi.responses import Response
+
+    from travel_ai_search.observability.metrics import _registry
+
+    return Response(content=_registry.render_all(), media_type="text/plain; version=0.0.4")

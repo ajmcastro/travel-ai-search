@@ -186,14 +186,33 @@ class FullSearchRequest(BaseModel):
 
 
 class FullSearchResponse(BaseModel):
-    """Response for POST /search — extends HybridSearchResponse with QU and RAG metadata."""
+    """Response for POST /search — extends HybridSearchResponse with QU and RAG metadata.
+
+    Per-stage timing fields (all in milliseconds):
+      took_ms          end-to-end wall-clock time from request receipt to response
+      qu_took_ms       query understanding (intent/entity extraction)
+      rewrite_took_ms  optional query rewriting via LLM (0 when not active)
+      lexical_took_ms  BM25 retrieval against OpenSearch
+      vector_took_ms   dense embedding + ANN search (0 on lexical_fallback)
+      reranking_took_ms cross-encoder reranking (0 when not active)
+      rag_took_ms      knowledge retrieval + LLM synthesis (0 when not active)
+
+    Observability fields:
+      strategy     which retrieval path ran: "hybrid", "multi_query", "lexical_fallback"
+      fallback_used whether a degradation fallback was triggered this request
+    """
 
     hits: list[SearchHit]
     total: int
     took_ms: int
-    lexical_took_ms: int
-    vector_took_ms: int
+    qu_took_ms: int = 0
+    rewrite_took_ms: int = 0
+    lexical_took_ms: int = 0
+    vector_took_ms: int = 0
     reranking_took_ms: int = 0
+    rag_took_ms: int = 0
+    strategy: str = "hybrid"
+    fallback_used: bool = False
     query_understanding: QueryUnderstandResponse
     rewritten_query: str | None = None
     expanded_queries: list[str] | None = None
@@ -206,6 +225,11 @@ class FullSearchResponse(BaseModel):
         result: HybridSearchResult,
         qu_response: QueryUnderstandResponse,
         *,
+        qu_took_ms: int = 0,
+        rewrite_took_ms: int = 0,
+        rag_took_ms: int = 0,
+        strategy: str = "hybrid",
+        fallback_used: bool = False,
         rewritten_query: str | None = None,
         expanded_queries: list[str] | None = None,
         knowledge_context: list[DestinationContextItem] | None = None,
@@ -219,9 +243,14 @@ class FullSearchResponse(BaseModel):
             hits=hits,
             total=result.total,
             took_ms=result.took_ms,
+            qu_took_ms=qu_took_ms,
+            rewrite_took_ms=rewrite_took_ms,
             lexical_took_ms=result.lexical_took_ms,
             vector_took_ms=result.vector_took_ms,
             reranking_took_ms=result.reranking_took_ms,
+            rag_took_ms=rag_took_ms,
+            strategy=strategy,
+            fallback_used=fallback_used,
             query_understanding=qu_response,
             rewritten_query=rewritten_query,
             expanded_queries=expanded_queries,

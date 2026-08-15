@@ -1560,3 +1560,88 @@ In travel IR, this is valuable for two query classes:
 - **Weighted edges**: all edges are currently unweighted binary links. Weighting (e.g. similarity strength 0–1) is a natural extension.
 - **Hotel nodes in the graph**: would require re-reading the full hotel JSONL at startup; adds ~5,000 nodes without clear query-time benefit in this prototype.
 - **Reverse SIMILAR_TO index**: computed on-the-fly by scanning airport nodes in `GET /graph/airports` — acceptable for 8 airports, but would be pre-indexed for larger graphs.
+
+---
+
+## Milestone 15 — Production API, observability, resilience, and final evaluation
+
+### What we added
+
+1. **Per-stage pipeline timing** — `FullSearchResponse` now includes `qu_took_ms`, `rewrite_took_ms`, `rag_took_ms`, `strategy`, and `fallback_used` alongside the existing `lexical_took_ms`, `vector_took_ms`, `reranking_took_ms`. The `full_search_endpoint` measures each stage with `time.perf_counter()` and patches `took_ms` to cover the full end-to-end wall-clock time.
+
+2. **Structured request logging** — after each `POST /search`, a single `INFO` record is emitted via `logger.info("search_request_completed", extra={...})` with all pipeline fields. With `LOG_FORMAT=json` in the environment, the `StructuredFormatter` serialises every `travel_ai_search.*` record as one line of NDJSON, enabling log queries like `jq 'select(.strategy=="lexical_fallback")'`.
+
+3. **In-memory metrics registry** (`observability/metrics.py`) — `Counter` and `Histogram` classes with thread-safe increment/observe operations and Prometheus text-format rendering. Three module-level singletons: `search_requests_total` (counter, labelled by strategy), `search_latency_ms` (histogram, 10 buckets from 5 ms to 5 s), `search_fallbacks_total` (counter, labelled by reason). `GET /metrics` exposes these in the Prometheus exposition format so any scraper can collect them.
+
+4. **Enhanced `/health` endpoint** (`api/routes/health.py`) — replaces the inline one-liner with a deep check: OpenSearch cluster ping, hotel index existence, embedding provider class name, reranker status, graph node/edge counts. Returns `503` only when OpenSearch is unreachable (the API cannot serve any requests); otherwise `200` with an `"ok"` or `"degraded"` status and a per-component map.
+
+5. **Runtime resilience in `POST /search`** — two new try/except blocks:
+   - Query rewriting: if `rewriter.rewrite()` raises at runtime (e.g. LLM timeout), a warning is logged and `retrieval_query` stays as the original semantic query. `rewritten_query` remains `None` in the response.
+   - Hybrid search: if `hybrid_search()` raises (e.g. embedding model unavailable), the endpoint falls back to `lexical_search()`, constructs a `HybridSearchResult` from the lexical result (with `vector_took_ms=0`), and sets `strategy="lexical_fallback"`, `fallback_used=True`.
+
+6. **Final evaluation** — all seven strategies run against the 62-query golden set. Results saved to `data/evaluation/results/`.
+
+### Concepts
+
+#### Structured logging vs. log formatting
+
+"Structured logging" means emitting log records where the metadata lives in typed key-value fields, not embedded in the message string. Compare:
+
+- Unstructured: `"POST /search: 170ms, 10 hits, hybrid"`
+- Structured: `logger.info("search_request_completed", extra={"strategy": "hybrid", "total_took_ms": 170, "result_count": 10})`
+
+With the `StructuredFormatter`, these extras become top-level JSON keys. A monitoring system can then query `total_took_ms > 500` without text parsing. Without JSON formatting, the extras are still present in the Python `LogRecord` object — just not rendered in the human-readable output.
+
+#### Prometheus pull-based metrics model
+
+Prometheus does not receive metrics pushed by the application. Instead, it sends `GET /metrics` to the app on a regular interval (typically 15–60 s). The app renders its in-memory counters and histograms into the text exposition format at that moment. This means:
+- Metrics survive application restarts only if persisted externally (Prometheus itself stores the scraped data).
+- The in-memory registry is reset on every process restart — acceptable for our prototype, where the primary value is debugging the current server instance.
+- For production, a persistent store or a proper `prometheus_client` library (which uses mmap for cross-process sharing) would be preferred.
+
+#### Histogram bucket design
+
+A Prometheus histogram does not store individual observations. It maintains:
+- `_count`: total observations
+- `_sum`: sum of all observed values (enables average computation)
+- `_bucket{le="X"}`: count of observations ≤ X (cumulative, enabling percentile estimation)
+
+Bucket boundaries must be chosen before deployment. The default buckets here (5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000 ms) span the realistic latency range for this pipeline: sub-10ms for pure BM25, ~100ms for hybrid, ~500ms for hybrid+reranking+RAG. Percentiles (p50, p95) are estimated from bucket counts by Prometheus queries, not computed exactly — the accuracy depends on bucket density around the actual distribution.
+
+#### Graceful degradation as an IR property
+
+In search systems, a 500 error is often worse than a degraded result. A user who gets BM25 results when the embedding model fails still sees something relevant; a user who gets an error sees nothing. The fallback hierarchy in this system is:
+1. Full pipeline (query understanding → rewriting → hybrid search + optional reranking → RAG)
+2. Rewrite fails → skip rewriting, use semantic query
+3. Hybrid fails → BM25 only (`strategy="lexical_fallback"`)
+4. Reranker fails → fused results (handled inside `hybrid.py` already)
+5. RAG knowledge retrieval fails → hotel results only, no summary
+
+Each level trades quality for availability. The key observability requirement is that every fallback is logged and reflected in the response, so operators can detect prolonged degradation.
+
+#### Liveness vs. readiness health checks
+
+Kubernetes (and most orchestration systems) support two types of health probes:
+- **Liveness**: "Is the process running?" — a minimal check that the HTTP server can respond. A failed liveness probe causes the container to be restarted.
+- **Readiness**: "Can this instance serve traffic?" — a deeper check of dependencies. A failed readiness probe removes the instance from the load balancer pool without restarting it.
+
+The `/health` endpoint here functions as a readiness probe: it verifies OpenSearch is reachable, the index exists, and the embedding model is loaded. A Kubernetes deployment would configure this as `readinessProbe: httpGet: /health` with a success threshold of status not being `"unavailable"`.
+
+### Design decisions
+
+| Decision | Chosen | Rejected | Reason |
+|---|---|---|---|
+| Metrics implementation | Custom `Counter`/`Histogram` in 150 lines | `prometheus_client` library | Educational value; no new dependency; ~80% of production API coverage without complexity |
+| JSON logging activation | `LOG_FORMAT=json` env var (default: text) | Always JSON | Text format is more readable during local development; JSON mode is a one-line `.env` change for production |
+| Health HTTP status | 200 for ok/degraded, 503 for unavailable | 200 always / 503 for any non-ok | Load balancers should remove instances when OpenSearch is down; optional components (reranker) being disabled is not a failure |
+| Resilience scope | Try/except at endpoint level for rewrite+hybrid | Try/except deep inside retrieval functions | Endpoint-level fallback is explicit, testable, and visible in the response; inner catches would hide the degradation |
+| Timing approach | `time.perf_counter()` at each stage boundary | OpenTelemetry spans | `perf_counter` has no dependencies; spans add significant complexity for the added value of distributed tracing |
+| Final `took_ms` | Patched to full end-to-end wall-clock | Use `result.took_ms` from hybrid_search | `hybrid_search.took_ms` only covers retrieval; QU + serialization + RAG are not included |
+
+### What was not done and why
+
+- **`prometheus_client` library**: would be the production choice but adds a dependency and hides the counter/histogram implementation that is the learning objective here.
+- **OpenTelemetry / distributed tracing**: extremely valuable in a microservices architecture but overkill for a single-process educational project.
+- **Persistent metrics across restarts**: in-memory metrics reset on each server restart — acceptable since the prototype demonstrates the pattern, not production operation.
+- **Separate `/health/live` and `/health/ready`**: a single `/health` endpoint covers both in this project; split only if deploying to Kubernetes with separate probe configurations.
+- **Graph-boosted ranking**: while it was identified in M14's "future work", integrating graph traversal into the scoring pipeline (rather than as standalone exploration endpoints) is beyond the educational scope of this project.

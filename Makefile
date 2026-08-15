@@ -133,6 +133,10 @@ ingest-knowledge: ## Create knowledge index and ingest destination docs  [Milest
 evaluate: ## Run search evaluation across all strategies  [Milestone 4+]
 	uv run python scripts/evaluate.py
 
+.PHONY: final-eval
+final-eval: ## Run final evaluation across all strategies and save results  [Milestone 15]
+	uv run python scripts/evaluate.py --output data/evaluation/final_results.json
+
 # ── Help ───────────────────────────────────────────────────────────────────────
 
 .PHONY: help

@@ -764,3 +764,105 @@ This illustrates the complementary nature of the two approaches: vector search f
 - Could the graph be built from behavioral data (booking co-occurrence) rather than editorial curation, making it more like collaborative filtering?
 - Would a sparse matrix representation of the graph enable efficient batch scoring — multiplying hotel relevance scores by destination similarity to produce "graph-boosted" ranking?
 - In a production system, how would you keep editorial similarity links fresh without a full re-ingest cycle?
+
+---
+
+## Milestone 15 — Production API, observability, resilience, and final evaluation
+
+### Hypothesis
+
+Adding per-stage pipeline timing, structured request logging, in-memory Prometheus-compatible metrics, and an enhanced deep health endpoint does not change retrieval quality but enables post-hoc analysis of where latency is spent. Resilience fallbacks (rewriter fails → original query; hybrid fails → BM25) ensure the pipeline degrades predictably rather than returning 500 errors.
+
+### Configuration
+
+- Evaluation script: `uv run python scripts/evaluate.py`
+- 62 golden queries, 10 query classes, graded relevance 0–3, K=10
+- Server: default settings (no reranking, no query rewriting, no RAG, no expansion)
+- Date: 2026-08-15
+
+### Final evaluation results
+
+| Strategy | NDCG@10 | MRR | HitRate@10 | P@10 | Latency p50 | Latency p95 |
+|---|---|---|---|---|---|---|
+| BM25 | 0.5021 | 0.6874 | 0.8387 | 0.6161 | 26 ms | 46 ms |
+| Vector | **0.6940** | **0.8688** | **1.0000** | 0.7790 | 10 ms | 292 ms |
+| RRF | 0.6239 | 0.8449 | 0.9516 | 0.7210 | 50 ms | 86 ms |
+| Rerank | 0.6830 | 0.8191 | 0.9516 | **0.8935** | 109 ms | 178 ms |
+| Understand | 0.6312 | 0.8620 | 0.9355 | 0.7290 | 46 ms | 75 ms |
+| Rewrite | 0.6130 | 0.8226 | **0.9677** | 0.7242 | 56 ms | 126 ms |
+| Expand | 0.6285 | 0.8308 | 0.9516 | 0.7226 | 167 ms | 218 ms |
+
+*Best value per metric shown in bold.*
+
+### Observability experiment — per-stage timing
+
+Running `POST /search` with the new timing fields exposed:
+
+```
+curl -s -X POST http://localhost:8765/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "family beach hotel Greece July"}'
+```
+
+Sample timing breakdown:
+- `took_ms`: 170 (end-to-end including FastAPI overhead)
+- `qu_took_ms`: 0 (rule-based, pure Python, sub-millisecond)
+- `rewrite_took_ms`: 0 (disabled)
+- `lexical_took_ms`: 21 (OpenSearch BM25 query)
+- `vector_took_ms`: 11 (ANN + embedding)
+- `reranking_took_ms`: 0 (disabled)
+- `rag_took_ms`: 0 (disabled)
+
+**Finding:** the bulk of latency when reranking is disabled is split between the two OpenSearch queries (BM25 + vector). The `took_ms` total is larger than `lexical_took_ms + vector_took_ms` because it includes FastAPI serialization, Pydantic validation, and embedding inference time not separately tracked.
+
+### Observability experiment — Prometheus metrics endpoint
+
+After sending 10 POST /search requests, `GET /metrics` returns:
+
+```
+travel_search_requests_total{strategy="hybrid"} 10
+travel_search_latency_ms_bucket{le="100"} 0
+travel_search_latency_ms_bucket{le="250"} 8
+travel_search_latency_ms_bucket{le="500"} 10
+travel_search_latency_ms_count 10
+travel_search_latency_ms_sum 1840.000
+```
+
+This tells us: 8 of 10 requests completed under 250 ms (p80), all under 500 ms. A Prometheus scraper could compute p50/p95 from these bucket values.
+
+### Deep health check
+
+`GET /health` now returns component-level status:
+
+```json
+{
+  "status": "ok",
+  "components": {
+    "opensearch": {"status": "ok", "version": "2.15.0"},
+    "index":      {"status": "ok", "name": "travel_hotels"},
+    "embedding":  {"status": "ok", "provider": "LocalEmbeddingProvider"},
+    "reranker":   {"status": "disabled", "detail": "set RERANKING_ENABLED=true to activate"},
+    "graph":      {"status": "ok", "nodes": "38", "edges": "309"}
+  }
+}
+```
+
+This is the key difference from a shallow liveness probe: a readiness check verifies that the index is populated and the embedding model is loaded before considering the instance ready to serve traffic.
+
+### Key observations
+
+1. **Vector search is the strongest single strategy** for this synthetic dataset: NDCG@10=0.694, HitRate@10=1.000 (it finds at least one relevant result for every query). BM25 fails on exact-destination queries where the destination name appears in the description but not the title.
+
+2. **Reranking improves Precision@10** (0.79 → 0.89) without improving HitRate, confirming the expected behaviour: the candidates are already there, the reranker just moves them up. NDCG@10 is slightly lower than pure vector (0.683 vs 0.694) because the reranker only sees the top-50 hybrid candidates, not the full vector list.
+
+3. **Query expansion (multi-query) adds latency (~167 ms p50) without consistent metric improvement** over RRF alone (0.629 vs 0.624). The benefit is query-class-specific: for vague discovery queries it helps; for exact-destination queries it can dilute precision.
+
+4. **BM25 consistently fails on exact-destination queries** (NDCG=0.187 for `exact_destination` class) — the index's BM25 fields boost hotel names but the golden queries ask for destinations, and there can be many hotels per destination.
+
+5. **Graceful degradation is testable**: 9 new resilience tests verify that rewriter failure, embedding failure, and RAG failure all produce valid 200 responses with appropriate `strategy` and `fallback_used` fields rather than 500 errors.
+
+### Surprises
+
+- The vector model achieves **HitRate@10=1.000** — it finds at least one relevant hotel for every query in the golden set. This is surprising because the model (`all-MiniLM-L6-v2`) was not fine-tuned for travel data.
+- **Query rewriting reduces NDCG@10** compared to raw hybrid (0.613 vs 0.624). The local LLM keyword-expansion rewriter adds terms that push the query toward noisier candidates. This highlights that rewriting quality matters more than the pipeline mechanism.
+- **QU is essentially free** (`qu_took_ms` ≈ 0 ms): the rule-based extraction is pure Python regex matching, not ML inference.

@@ -38,7 +38,23 @@ def test_health_returns_ok(_: MagicMock) -> None:
     with TestClient(app) as client:
         response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    data = response.json()
+    # The deep health endpoint always includes a top-level "status" field.
+    assert "status" in data
+    # Components map is also present.
+    assert "components" in data
+
+
+@patch("travel_ai_search.api.app.create_client", return_value=MagicMock())
+def test_health_components_present(_: MagicMock) -> None:
+    with TestClient(app) as client:
+        data = client.get("/health").json()
+    components = data["components"]
+    assert "opensearch" in components
+    assert "index" in components
+    assert "embedding" in components
+    assert "reranker" in components
+    assert "graph" in components
 
 
 # ── Lexical search endpoint ───────────────────────────────────────────────────

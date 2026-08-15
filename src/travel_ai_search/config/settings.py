@@ -24,6 +24,10 @@ class Settings(BaseSettings):
 
     # Application
     log_level: str = "INFO"
+    # log_format: "text" (default, human-readable) or "json" (NDJSON for production).
+    # When "json", all travel_ai_search.* log records are serialised as one JSON
+    # object per line, making them directly queryable by Loki, CloudWatch, etc.
+    log_format: str = "text"
     environment: str = "development"
 
     # Search
