@@ -35,6 +35,21 @@ from travel_ai_search.query_understanding.extractor import RuleBasedQueryUnderst
 from travel_ai_search.query_understanding.rewriter import QueryRewriter
 from travel_ai_search.reranking.base import Reranker
 
+# Configure application logging.
+#
+# Uvicorn's dictConfig only configures uvicorn.* loggers and leaves the root
+# logger without a handler.  Records that propagate from travel_ai_search.*
+# loggers reach Python's "handler of last resort" (level=WARNING), so INFO
+# messages are silently dropped without the two lines below.
+#
+# logging.basicConfig() adds a StreamHandler to the root logger only when it
+# has no handlers yet — a no-op if any other setup (e.g. test runners) has
+# already installed one.  We then set the travel_ai_search namespace to the
+# configured level so that all application loggers respect log_level without
+# changing uvicorn's verbosity (controlled separately via --log-level).
+logging.basicConfig(format="%(levelname)s:%(name)s: %(message)s")
+logging.getLogger("travel_ai_search").setLevel(get_settings().log_level.upper())
+
 logger = logging.getLogger(__name__)
 
 
