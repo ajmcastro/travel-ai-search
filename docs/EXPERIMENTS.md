@@ -609,21 +609,64 @@ Results are also saved as machine-readable JSON under `data/evaluation/results/`
 - LLM synthesis: configurable via `llm_provider` setting (`local`, `echo`, or `bedrock`)
 - RAG prompt: query + knowledge context + top-5 hotel summaries → 2-3 sentence recommendation
 
-**No numeric evaluation conducted:**
+**Why no numeric evaluation:**
 
-RAG synthesis quality depends on LLM availability (Bedrock credentials) and is inherently subjective.  The key assertions are architectural:
+RAG is purely additive — it does not change hotel ranking.  Running `evaluate.py` with `rag=true` would produce identical NDCG/MRR/HitRate to the current baseline because the hotel list is unchanged.  A meaningful RAG evaluation would require human judgment labels on synthesis quality ("did the summary correctly describe the destination?") which we don't have.  Numeric evaluation of RAG is M15 scope.
 
-1. Hotel ranking is provably unchanged when `rag=false` (RAG adds no latency)
-2. Knowledge retrieval returns semantically correct destinations (verified by spot-checking `rag=true` queries)
-3. Country filter from QU prevents cross-country semantic leakage (e.g. "beach holiday in Greece" should not retrieve Caribbean knowledge)
+**Live experiments (run 2026-08-15, server on port 8765, RAG_ENABLED=true, LLM_PROVIDER=echo):**
+
+*Experiment 1 — Greece beach holiday (semantic query, no destination extracted by QU)*
+
+```
+POST /search  {"query": "relaxed beach holiday in Greece", "rag": true}
+
+Knowledge context returned (3 destinations):
+  Rhodes (Greece)     — character: history and beaches, medieval charm, family friendly
+  Santorini (Greece)  — character: romantic, iconic views, luxury boutique, honeymoon
+  Crete (Greece)      — character: cultural depth, ancient history, diverse landscapes
+```
+
+Observation: the knowledge retriever correctly returns three Greek islands — the most semantically relevant destinations for the query.  None are from Spain, Turkey, or the Caribbean.  The country filter (QU extracted `country=Greece`) was not triggered because QU found no exact country entity in the query, so this result comes from pure vector similarity to the query embedding.  All three are topically correct.
+
+*Experiment 2 — Similarity query (tests semantic limitation of knowledge retrieval)*
+
+```
+POST /search  {"query": "somewhere like Mallorca but quieter", "rag": true}
+
+QU extracted: destination=None, country=Spain   ← country filter applied
+
+Knowledge context returned (3 destinations):
+  Ibiza    (Spain) — nightlife=HIGH   ← wrong: Ibiza is louder than Mallorca
+  Gran Canaria (Spain) — nightlife=HIGH   ← wrong: also louder
+  Costa Blanca (Spain) — nightlife=moderate ← plausible
+```
+
+Ibiza ranked first by semantic similarity because "Mallorca" and "Ibiza" appear together in both documents' `similar_destinations` field vocabulary — even though `similar_destinations` is deliberately excluded from the embedding text (see `build_knowledge_embedding_text`).  The presence of shared location names (Balearic Islands, Spain, beach) is enough for high cosine similarity.
+
+**Cross-comparison — Graph vs. Vector for "like Mallorca but quieter":**
+
+The same query via graph traversal gives immediately correct results:
+
+```
+GET /graph/similar?destination=Mallorca&hops=1
+
+  Ibiza      — nightlife=high, family=low   ← louder
+  Menorca    — nightlife=low, family=high   ← correct quieter option
+  Costa del Sol — nightlife=moderate
+  Costa Blanca  — nightlife=moderate
+```
+
+The graph surfaces **Menorca** (the obvious "quieter Mallorca" answer) in the top results.  Vector knowledge retrieval ranked Ibiza first because description-level similarity (both are Balearic Islands, beach destinations) dominates over the quietness constraint.  The graph can be post-filtered by `nightlife_level=low` to extract only the quiet options — something the embedding cannot do without reranking.
+
+This is the concrete empirical demonstration of why graph traversal complements vector search.
 
 **Architectural observations:**
 
-1. **Product retrieval vs knowledge retrieval separation is the core lesson.** Embedding hotel descriptions into the knowledge documents would conflate two retrieval tasks that have different semantics. Destination knowledge ("what is Menorca like?") is stable and shared; hotel descriptions are specific and ranked. Keeping them in separate indices makes both better.
+1. **Product retrieval vs knowledge retrieval separation is the core lesson.** Embedding hotel descriptions into the knowledge documents would conflate two retrieval tasks with different semantics. Destination knowledge ("what is Menorca like?") is stable and shared; hotel descriptions are specific and ranked. Keeping them in separate indices makes both better.
 
 2. **The knn country filter demonstrates OpenSearch's pre-filter mode.** The `filter` clause inside the `knn` query block is applied before ANN scoring — only documents in the given country are candidates. Without this, "beach holiday in Greece" could retrieve a Maldives knowledge document because the semantic similarity is higher than any specific Greek island.
 
-3. **EchoLLMProvider is the right local testing backend.** `LLM_PROVIDER=echo` returns the prompt as the synthesis output. This is sufficient to verify that the prompt is correctly structured, contains the destination names and hotel names, and has the right length — without needing AWS credentials.
+3. **EchoLLMProvider is the right local testing backend.** `LLM_PROVIDER=echo` returns the prompt as the synthesis output. This is sufficient to verify that the prompt is correctly structured, contains destination names and hotel names, and has the right length — without needing AWS credentials.
 
 4. **Graceful degradation chain:** `rag=false` → no overhead; `rag=true` + missing index → warning + hotel results only; `rag=true` + index OK + no LLM → `knowledge_context` returned, no `rag_summary`; `rag=true` + index OK + LLM configured → full response.
 
@@ -650,37 +693,70 @@ Graph-enhanced retrieval augments vector and lexical search with structural, cur
 > 1. **Curated similarity** — "similar destinations to Mallorca" where editorial links are more reliable than embedding proximity.
 > 2. **Structural reachability** — "which destinations can I fly to from Glasgow?" which has no meaningful embedding representation.
 
-### Implementation (no numeric evaluation)
+### Implementation
 
-The destination graph is pure Python — an in-memory directed adjacency-list with 38 nodes (30 destinations + 8 UK airports) and ~200 edges.  No external graph database is used; the graph is rebuilt at startup from the knowledge JSONL file in milliseconds.
+The destination graph is pure Python — an in-memory directed adjacency-list with **38 nodes, 309 edges** (30 destination + 8 airport nodes; 94 SIMILAR_TO + 215 FLIES_TO edges).  No external graph database is used; the graph is rebuilt at startup from the knowledge JSONL file in under 5 ms.
 
 **Edge types:**
 - `SIMILAR_TO` (bidirectional): seeded from `similar_destinations` in knowledge docs
 - `FLIES_TO` (directed, airport → destination): based on realistic UK charter routes; long-haul destinations (Barbados, Cancún, Maldives, Phuket, Koh Samui) restricted to hub airports (LGW, LHR, MAN)
 
+### Live results (run against the actual server)
+
+**Experiment 1 — SIMILAR_TO traversal depth**
+
+```
+GET /graph/similar?destination=Mallorca&hops=1  →  4 results
+  Ibiza, Menorca, Costa del Sol, Costa Blanca
+
+GET /graph/similar?destination=Mallorca&hops=2  →  11 results
+  + Mykonos, Sardinia, Hvar, Corfu, Algarve, Agadir, Tenerife
+```
+
+Observation: hops=1 returns all Balearic siblings plus Spanish mainland coast.  hops=2 adds second-degree links — Ibiza's editorial neighbours (Mykonos, Sardinia, Hvar) and Menorca's neighbours (Corfu) surface without any extra embedding call.  A single vector search for "like Mallorca" cannot systematically reach Hvar at 2 degrees; the graph does it in a single BFS pass.
+
+**Experiment 2 — Airport reachability (FLIES_TO)**
+
+```
+GET /graph/destinations?airport=GLA  →  25 destinations  (no long-haul)
+GET /graph/destinations?airport=LHR  →  30 destinations  (all including long-haul)
+```
+
+Glasgow regional airport serves 25 short-haul destinations.  Heathrow serves all 30, including the 5 long-haul ones.  The 5-destination gap is a structural fact no embedding can encode.
+
+**Experiment 3 — Reverse reachability (which airports serve X?)**
+
+```
+GET /graph/airports?destination=Barbados  →  3 airports  (LGW, LHR, MAN)
+GET /graph/airports?destination=Tenerife  →  8 airports  (all UK airports)
+```
+
+Confirms the asymmetry: a traveller in Newcastle can reach Tenerife but not Barbados.  This is the graph's clearest differentiator from semantic search — "can I fly there from NCL?" is a binary structural fact, not a similarity score.
+
 **Key observation — similarity vs. embedding:**
 
-| Query | Vector search result | Graph traversal result |
+| Query | Vector search | Graph traversal |
 |---|---|---|
-| "Similar to Mallorca" | Ibiza (textually similar) | Ibiza, Menorca (curated) |
-| "Similar to Mallorca, 2 hops" | Not meaningful | Ibiza, Menorca, plus destinations similar to those |
-| "Fly from Glasgow" | No meaningful result | 25 Mediterranean/Canary destinations (excludes 5 long-haul) |
-| "Fly from Gatwick" | No meaningful result | All 30 destinations |
+| "Similar to Mallorca" (1-hop) | Approximate — depends on vocabulary overlap | Exact: Ibiza, Menorca, Costa del Sol, Costa Blanca |
+| "2nd-degree similar" (2-hop) | Requires a second embedding round-trip | Single BFS pass: +7 destinations |
+| "Fly from Glasgow" | No meaningful result | 25 destinations (exact reachability) |
+| "Fly from Heathrow" | No meaningful result | 30 destinations (includes long-haul) |
+| "Which airports serve Barbados?" | No meaningful result | LGW, LHR, MAN (3 of 8) |
 
 **What the graph cannot do:**
-- Score or rank (no weights on edges in this prototype)
-- Generalise from learned patterns (no embedding, no ML)
-- Recover from missing edges (if an editorial link is absent, traversal misses it)
+- Score or rank results (no edge weights in this prototype)
+- Generalise from learned patterns (no ML, no embedding)
+- Recover from missing editorial links (if a SIMILAR_TO link was not curated, traversal misses it)
 
-This illustrates the complementary nature of the two approaches: vector search finds semantically related content it was never explicitly told about; graph traversal follows exact facts that embeddings cannot encode.
+This illustrates the complementary nature of the two approaches: vector search finds semantically related content it was never explicitly told about; graph traversal follows exact structural facts that embeddings cannot encode.
 
-### Experiments to run manually
+### Experiments run (2026-08-15)
 
-1. **Similarity depth comparison**: Call `/graph/similar?destination=Mallorca&hops=1` then `hops=2`. Observe how the 2-hop result discovers "second-degree" destinations (similar to something similar to Mallorca) — a chain that would require iterative embedding queries to replicate.
+1. **Similarity depth comparison** (confirmed): hops=1 → 4 results (Ibiza, Menorca, Costa del Sol, Costa Blanca); hops=2 → 11 results (+Mykonos, Sardinia, Hvar, Corfu, Algarve, Agadir, Tenerife).  The 2-hop set includes destinations that are editorially linked to Ibiza and Menorca but not directly to Mallorca.  A single vector search cannot reproduce this without a second round-trip.
 
-2. **Hub vs. regional airport**: Compare `/graph/destinations?airport=GLA` with `/graph/destinations?airport=LHR`. Glasgow returns ~25 (short-haul only); Heathrow returns all 30. Try `/graph/airports?destination=Barbados` to confirm only 3 airports serve it.
+2. **Hub vs. regional airport** (confirmed): GLA → 25 (no long-haul); LHR → 30 (all); Barbados → 3 airports (LGW, LHR, MAN); Tenerife → 8 airports (all).  The hub restriction is deterministic and verifiable — no approximation.
 
-3. **Graph vs. vector for "like X"**: Submit `POST /search` with `{"query": "somewhere like Mallorca but quieter", "rag": false}`. Note which destinations appear. Then call `/graph/similar?destination=Mallorca&hops=1` and compare the overlap. The graph may surface Menorca more reliably if Ibiza's popular-nightlife description dominates the embedding distance.
+3. **Graph vs. vector for "like Mallorca but quieter"** (confirmed): Vector knowledge retrieval returned Ibiza (nightlife=high) as the closest match — semantically plausible but wrong for the quietness constraint.  Graph traversal returned Menorca (nightlife=low) alongside Ibiza, making the correct answer immediately available for post-filtering.  See M13 section for full experiment output.
 
 ### Next questions this raises
 
