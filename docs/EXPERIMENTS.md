@@ -866,3 +866,27 @@ This is the key difference from a shallow liveness probe: a readiness check veri
 - The vector model achieves **HitRate@10=1.000** — it finds at least one relevant hotel for every query in the golden set. This is surprising because the model (`all-MiniLM-L6-v2`) was not fine-tuned for travel data.
 - **Query rewriting reduces NDCG@10** compared to raw hybrid (0.613 vs 0.624). The local LLM keyword-expansion rewriter adds terms that push the query toward noisier candidates. This highlights that rewriting quality matters more than the pipeline mechanism.
 - **QU is essentially free** (`qu_took_ms` ≈ 0 ms): the rule-based extraction is pure Python regex matching, not ML inference.
+
+---
+
+### Evaluation validity — known limitations
+
+#### Generator effect
+
+The hotel documents, evaluation queries, and relevance labels all originate from the same synthetic pipeline (`generate_dataset.py` + `build_golden_dataset.py`). This creates a circularity risk: the relative performance of each retrieval strategy is measured against a notion of relevance that was defined by the same process that generated the corpus.
+
+Dense retrieval is particularly susceptible. Embedding models are trained to collapse paraphrase variation — semantically equivalent sentences — into nearby positions in the vector space. Synthetic text tends to use consistent, templated vocabulary, which is exactly the kind of variation embeddings handle best. As a result, the **38.6% NDCG improvement of vector over BM25 is an upper bound** on the real-world advantage, not a clean measurement of the retrieval method's merit in isolation. On a corpus of real hotel descriptions written by different authors with varied vocabulary, the gap would likely be smaller.
+
+**Partial mitigant:** the relevance labels are *attribute-based*, not LLM-generated. A hotel is marked relevant for a query when its structured fields (country, `family_friendly`, price, star rating, `adults_only`, etc.) match the query's constraints programmatically. This avoids the deepest form of circularity — the judge is not the same generative process that wrote the documents. The generator effect is real but attenuated.
+
+**Mitigation path:** a small held-out set of queries written by a person who read the documents but never saw the generation prompts — evaluated separately from the generated golden set — would allow the gap between the two slices to be measured. The difference in relative method rankings between the human slice and the generated slice is the empirical size of the generator effect. This is the recommended next step before drawing strong conclusions about which strategy wins in production.
+
+#### Statistical power
+
+The golden dataset contains 62 queries across 10 query classes. This is sufficient to demonstrate the evaluation methodology and rank strategies overall, but the per-class sample sizes (4–10 queries) produce wide confidence intervals. A 10-query class (e.g., `exact_destination`) is not large enough to confirm that a measured difference — say, +5% NDCG — is statistically significant rather than sampling noise. Method rankings within individual query classes should be treated as indicative, not conclusive.
+
+Splitting the 62 queries into human-written and generated slices (to measure the generator effect above) would leave approximately 30 queries per slice — too few for reliable per-slice method rankings at conventional significance thresholds. More queries would be needed before that comparison becomes informative.
+
+#### LLM-as-judge (future milestone)
+
+If a future evaluation uses an LLM as a relevance judge and the same model family generated the synthetic corpus, the judge and the generator share the same linguistic biases and internal knowledge representation. Their agreement reads as high precision, but part of that agreement is structural (shared bias) rather than a genuine signal of retrieval quality. To avoid this, an LLM-as-judge evaluation should use a different model family from the one that generated the data, or supplement LLM judgments with a human-annotated held-out slice.
