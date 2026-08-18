@@ -172,6 +172,16 @@ uv run python scripts/evaluate.py --strategy understand
 
 # Run query rewriting evaluation: QU + LocalLLMProvider keyword expansion + RRF (Milestone 10)
 uv run python scripts/evaluate.py --strategy rewrite
+
+# LLM-as-judge evaluation (Milestone 16)
+# Dry run with EchoJudge — no AWS credentials required; verifies the pipeline end-to-end
+make evaluate-judge
+
+# All strategies on both slices + generator-effect gap table (Spearman ρ, Kendall τ)
+make evaluate-judge-all
+
+# With real Bedrock judge (requires AWS credentials and JUDGE_PROVIDER=bedrock in .env)
+uv run python scripts/evaluate_judge.py --all-strategies --slice both --judge-provider bedrock
 ```
 
 ---
@@ -264,6 +274,12 @@ curl "localhost:8000/health"
 
 # Prometheus metrics scrape — counters, latency histogram in text exposition format
 curl "localhost:8000/metrics"
+
+# LLM-as-judge evaluation (Milestone 16)
+# EchoJudgeProvider (default, no AWS): fixed score=2, verifies pipeline wiring
+curl -X POST "localhost:8000/evaluate/judge" \
+  -H "Content-Type: application/json" \
+  -d '{"queries":[{"query_text":"beach holiday with kids","query_class":"family"}],"strategy":"rrf","k":5}'
 
 # Full search with complete per-stage timing in response (Milestone 15)
 # Response now includes: qu_took_ms, rewrite_took_ms, lexical_took_ms,
@@ -382,6 +398,8 @@ Copy `.env.example` to `.env` (or run `make env`) and adjust as needed. All sett
 | `RAG_CONTEXT_K` | `3` | Number of destination knowledge docs to retrieve per RAG query |
 | `GRAPH_ENABLED` | `true` | Build in-memory destination graph at startup (set `false` to disable `/graph/*` endpoints) |
 | `KNOWLEDGE_FILE_PATH` | `data/knowledge/destinations.jsonl` | JSONL file used to seed the destination graph |
+| `JUDGE_PROVIDER` | `echo` | LLM judge backend: `echo` (fixed score=2, no AWS) or `bedrock` (M16) |
+| `BEDROCK_JUDGE_MODEL_ID` | `amazon.nova-lite-v1:0` | Judge model — must differ from the generator model family to avoid common-mode bias (M16) |
 
 ---
 
@@ -392,11 +410,14 @@ src/travel_ai_search/
 ├── api/
 │   ├── app.py               # FastAPI app, lifespan (OpenSearch + embedding provider)
 │   ├── deps.py              # FastAPI dependency injection
+│   ├── schemas/
+│   │   └── evaluate.py      # JudgeRequest, JudgeResponse, JudgedHit, JudgeQueryOutput (M16)
 │   └── routes/
 │       ├── search.py        # GET /search/lexical, GET /search/vector, POST /search
 │       ├── query.py         # POST /query/understand
 │       ├── health.py        # GET /health — deep health check (M15)
-│       └── graph.py         # GET /graph/similar, GET /graph/destinations, GET /graph/airports (M14)
+│       ├── graph.py         # GET /graph/similar, GET /graph/destinations, GET /graph/airports (M14)
+│       └── evaluate.py      # POST /evaluate/judge — LLM-as-judge scoring endpoint (M16)
 ├── config/
 │   └── settings.py          # Pydantic settings, loaded from env vars / .env
 ├── domain/
@@ -408,7 +429,10 @@ src/travel_ai_search/
 ├── evaluation/
 │   ├── dataset.py           # GoldenQuery, GoldenDataset, load_dataset()
 │   ├── evaluator.py         # evaluate(), EvaluationReport, SearchFn type
-│   └── metrics.py           # P@K, Recall@K, HitRate@K, RR, AP, NDCG@K
+│   ├── metrics.py           # P@K, Recall@K, HitRate@K, RR, AP, NDCG@K
+│   ├── judge.py             # JudgeProvider Protocol, JudgeVerdict, EchoJudgeProvider, prompt/parser (M16)
+│   ├── judge_bedrock.py     # BedrockJudgeProvider (amazon.nova-lite-v1:0, M16)
+│   └── judge_evaluator.py   # LLMEvaluator, JudgeReport, spearman_rho, kendall_tau, generator_effect_gap (M16)
 ├── ingestion/
 │   ├── index.py             # OpenSearch index mapping and CRUD (knn_vector)
 │   └── ingestor.py          # Bulk ingestion: load_products(), ingest()
@@ -420,7 +444,8 @@ src/travel_ai_search/
 │   ├── base.py              # QueryUnderstandingEngine Protocol (runtime_checkable)
 │   ├── models.py            # QueryUnderstanding dataclass + to_search_filters()
 │   ├── extractor.py         # RuleBasedQueryUnderstandingEngine (regex + keyword lookup)
-│   └── rewriter.py          # QueryRewriter (wraps LLMProvider; graceful fallback)
+│   ├── rewriter.py          # QueryRewriter (wraps LLMProvider; graceful fallback)
+│   └── expander.py          # LocalQueryExpander — generates N query variants for multi-query retrieval (M11)
 ├── reranking/
 │   ├── base.py              # Reranker Protocol (runtime_checkable, structural typing)
 │   ├── local.py             # LocalCrossEncoderReranker (sentence-transformers CrossEncoder)
@@ -457,6 +482,8 @@ scripts/
 ├── ingest_knowledge.py      # Create knowledge index and ingest 30 docs (M13)
 ├── build_golden_dataset.py  # Build golden evaluation dataset (one-time)
 ├── evaluate.py              # Run evaluation: --strategy bm25|vector|hybrid|rrf|rerank|understand|rewrite
+├── evaluate_judge.py        # LLM-as-judge CLI: --strategy, --slice, --judge-provider, generator-effect gap (M16)
+├── export_chat.py           # Export Claude Code chat history to docs/CHAT_HISTORY.md
 └── healthcheck.py           # Verify OpenSearch connectivity
 
 data/
@@ -465,11 +492,19 @@ data/
 ├── knowledge/
 │   └── destinations.jsonl   # 30 destination knowledge documents (M13)
 └── evaluation/
-    ├── golden_queries.jsonl # 62 queries, 48,675 graded judgments
-    └── results/             # JSON evaluation results per run
+    ├── golden_queries.jsonl  # 62 queries, 48,675 graded judgments
+    ├── human_queries.jsonl   # 20 human-written queries for generator-effect measurement (M16)
+    └── results/              # JSON evaluation results per run
+
+docs/
+├── PROJECT_SPEC.md          # Full learning objectives and milestone definitions
+├── EXPERIMENTS.md           # Hypothesis, results, and observations per milestone
+├── RATIONALE_PER_MILESTONE.md # IR concepts, design choices, and why behind each milestone
+├── CHAT_HISTORY.md          # Exported Claude Code session history (auto-generated)
+└── annotation_guide.md      # Guide for creating and grading human query annotations (M16)
 
 tests/
-├── unit/                    # No infrastructure required (525 tests)
+├── unit/                    # No infrastructure required (576 tests)
 └── integration/             # Requires OpenSearch running (132 tests)
 ```
 
