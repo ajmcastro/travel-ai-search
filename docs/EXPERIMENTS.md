@@ -928,8 +928,38 @@ On the generated slice, `agreement_rate` measures how often the LLM judge and th
 - The prompt deliberately avoids mentioning the corpus is synthetic — this prevents the judge from adjusting its scoring based on the data provenance rather than actual travel relevance.
 - `amazon.nova-lite-v1:0` was chosen as the default Bedrock judge because it is from Amazon's own model family, which is distinct from Anthropic Claude (the generator model family).  Using the same family (e.g., `anthropic.claude-haiku-*`) for both generation and judging would introduce common-mode bias.
 
+**Reviewer caveats (post-publication feedback)**
+
+Three methodological issues were raised after the M15 results were shared. They apply to the M16 design as well.
+
+#### 1 — Two independent slices are statistically underpowered; paired rewrites are better
+
+The current design compares strategy rankings on two *independent* samples: 62 generated queries and 20 human queries. Most of the variance between the two samples comes from **query difficulty** — some queries are inherently harder for any retrieval method, and with n ≈ 20–30 per slice, that difficulty variation swamps the phrasing signal. The difference between two independent means at this scale is not reliably distinguishable from sampling noise.
+
+A more powerful design: keep all 62 generated queries. Have someone who has not seen the generation prompts **rewrite each one in their own words** — same intent, different surface form. Evaluate every strategy on both phrasings. Compute the **per-query delta** (Δ NDCG for each of the 62 pairs) rather than two independent means. Pairing removes query difficulty as a confound, because the same underlying query is rated twice — the difficulty contribution cancels. The generator effect is then visible as the systematic component of the Δ: if dense retrieval drops more on human phrasings than BM25 does, that gap is the measurable signal.
+
+With this design, a sample size of 62 is sufficient to detect a meaningful generator effect. With two independent 20-query slices, it is not.
+
+*Mitigation path:* create `data/evaluation/rewritten_queries.jsonl` — the 62 golden queries, each given a human rewrite. The `LLMEvaluator` API already supports any JSONL query set; no code changes are needed. The evaluation script would be called twice (original and rewritten) and the per-query Δ computed as a post-processing step.
+
+#### 2 — Attribute-based labels create a ceiling that favours surface-form matching
+
+The golden relevance labels are produced by matching hotel structured fields (`country`, `family_friendly`, `price`, `adults_only`, etc.) to query filter values. This makes the label set **complete by construction for the encoded filters**: a hotel that satisfies all filter constraints receives the highest grade by definition. Two consequences follow.
+
+First, a retriever that recovers hotels by matching the **surface form** of the constraint (BM25 finding "Spain" when `country=Spain` is in the filter) operates at the ceiling for that query class. The evaluation does not distinguish between "retrieved this hotel because it is genuinely suitable" and "retrieved this hotel because it shares lexical tokens with the filter value."
+
+Second, a hotel that is semantically excellent for the query but falls outside the filter — for example, a hotel that would be great for families but has `family_friendly=false` in its structured data — is counted as irrelevant noise. The retrieval system that surfaces it is penalised even if a real traveller would prefer it. The evaluation measures **filter-constraint recovery**, not **travel suitability**.
+
+This limitation does not invalidate the evaluation; it contextualises it. The results should be read as: "how well does each strategy recover the filter-encoding constraints" rather than "how well does each strategy find hotels a real person would book."
+
+#### 3 — Paired rewrites test phrasing variation, not intent coverage
+
+Even a perfect paired-rewrite evaluation cannot reveal intents that the generation pipeline never encoded. Human rewrites preserve the query intent — they change only how that intent is phrased. If the generator never produced queries about accessible travel, business-trip travel, or multi-generational family holidays, no amount of rewriting will expose that gap. The only path to genuinely novel intents is a person reading the hotel documents from scratch and writing queries based on what they actually notice — which is what `human_queries.jsonl` partially attempts. But 20 queries written by one person in limited time is still shaped by what that person thought to look for.
+
+This is a fundamental ceiling of synthetic corpus evaluation: the evaluation set can only probe the intents the corpus supports, and the corpus encodes only the intents the generator was prompted to represent.
+
 **Next question this raises:**
 
 - What is the actual Spearman ρ when run with the Bedrock judge?  If ρ < 0.7, the generator effect is large enough to reconsider the synthetic evaluation results for vector search.
 - Does the agreement rate between the judge and the attribute-based labels differ by query class?  Low agreement on `multi_constraint` queries would suggest the judge weighs structured attributes differently from the rule-based labels.
-- Can the human query slice be expanded to ≥ 30 queries per class to produce statistically reliable per-class rankings?
+- Can the 62 generated queries each be given a human rewrite, enabling a statistically reliable paired-Δ measurement of the generator effect?
