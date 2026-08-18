@@ -890,3 +890,46 @@ Splitting the 62 queries into human-written and generated slices (to measure the
 #### LLM-as-judge (future milestone)
 
 If a future evaluation uses an LLM as a relevance judge and the same model family generated the synthetic corpus, the judge and the generator share the same linguistic biases and internal knowledge representation. Their agreement reads as high precision, but part of that agreement is structural (shared bias) rather than a genuine signal of retrieval quality. To avoid this, an LLM-as-judge evaluation should use a different model family from the one that generated the data, or supplement LLM judgments with a human-annotated held-out slice.
+
+---
+
+### [Milestone 16] LLM-as-judge evaluation
+
+**Date:** 2026-08-18
+**Hypothesis:** Using an LLM from a different model family than the generator to score retrieved hotels (0–3) will produce a relevance signal that is more independent of the synthetic corpus than the attribute-based golden labels.  Comparing strategy rankings on a human-written query slice versus the generated golden-query slice will reveal whether the generator effect inflates the advantage of dense retrieval on synthetic data.
+
+**Configuration:**
+
+- Judge: `EchoJudgeProvider` (default; fixed score=2, no LLM calls)
+- Bedrock judge (opt-in): `amazon.nova-lite-v1:0`  ← different family from the Claude generator
+- Strategies evaluated: bm25, vector, rrf
+- Generated slice: 62 golden queries (from `data/evaluation/golden_queries.jsonl`)
+- Human slice: 20 human-written queries (from `data/evaluation/human_queries.jsonl`)
+- Generator-effect metrics: Spearman ρ and Kendall τ between strategy rankings on the two slices
+
+**Results (dry run — EchoJudge, score=2 for all hotels):**
+
+The EchoJudgeProvider returns a fixed score of 2 for every hotel regardless of query, so all strategies produce identical mean judge scores (2.0) and no ranking difference is observable.  This is the expected baseline: it verifies the evaluation pipeline end-to-end without requiring AWS credentials.
+
+A meaningful generator-effect measurement requires:
+1. Enabling the Bedrock judge: `JUDGE_PROVIDER=bedrock` in `.env`
+2. Running: `make evaluate-judge-all` (both slices, all strategies)
+
+The Spearman ρ between strategy rankings on the two slices is the key output.  ρ ≈ 1 means both slices agree on which strategy wins (no generator effect).  ρ < 0.7 indicates a meaningful disagreement worth investigating.
+
+**Agreement rate:**
+
+On the generated slice, `agreement_rate` measures how often the LLM judge and the attribute-based golden label agree at the grade ≥ 2 threshold.  On the human slice, `agreement_rate` is always `null` because no pre-annotated golden grades exist — the judge is the sole signal.
+
+**Surprises / observations:**
+
+- The `LLMEvaluator` design decouples the judge from the retrieval function cleanly: any `JudgeProvider`-compatible object can replace the echo stub without changing the evaluator.
+- The `JudgeFn` type alias (`Callable[[str, int, dict], list[Hit]]`) required returning full `Hit` objects rather than doc IDs so the evaluator can pass `hotel_name` and `hotel_description` to the judge without a second OpenSearch lookup.
+- The prompt deliberately avoids mentioning the corpus is synthetic — this prevents the judge from adjusting its scoring based on the data provenance rather than actual travel relevance.
+- `amazon.nova-lite-v1:0` was chosen as the default Bedrock judge because it is from Amazon's own model family, which is distinct from Anthropic Claude (the generator model family).  Using the same family (e.g., `anthropic.claude-haiku-*`) for both generation and judging would introduce common-mode bias.
+
+**Next question this raises:**
+
+- What is the actual Spearman ρ when run with the Bedrock judge?  If ρ < 0.7, the generator effect is large enough to reconsider the synthetic evaluation results for vector search.
+- Does the agreement rate between the judge and the attribute-based labels differ by query class?  Low agreement on `multi_constraint` queries would suggest the judge weighs structured attributes differently from the rule-based labels.
+- Can the human query slice be expanded to ≥ 30 queries per class to produce statistically reliable per-class rankings?

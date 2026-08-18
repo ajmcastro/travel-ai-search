@@ -34,6 +34,7 @@ The project must progressively demonstrate:
 18. RAG concepts
 19. Graph-enhanced retrieval concepts
 20. Production search architecture and observability
+21. LLM-as-judge evaluation and methodology validity
 
 The final application should allow natural-language travel queries such as:
 
@@ -652,6 +653,57 @@ Only introduce Neo4j or another graph system if there is clear learning value.
 
 ---
 
+# LLM-as-judge evaluation
+
+## Purpose
+
+The golden relevance dataset used throughout Milestones 4–15 is attribute-based: a hotel is marked relevant for a query when its structured fields (country, `family_friendly`, price, star rating, `adults_only`, etc.) match the query's constraints programmatically. This is fast, deterministic, and reproducible, but it creates a circularity risk — the retrieval methods are ranked against a notion of relevance defined by the same pipeline that generated the corpus.
+
+An LLM-as-judge evaluation layer replaces (or supplements) the attribute-based labels with natural-language relevance judgments: given a query and a retrieved hotel description, ask an LLM to score how relevant the hotel is. This is a fundamentally different signal — the judge reads the text, not the structured fields.
+
+## The common-mode bias problem
+
+**If the LLM used to judge relevance is from the same model family that generated the synthetic hotel descriptions, the judge and the generator share the same linguistic biases and internal knowledge representation. Their agreement reads as high precision, but part of that agreement is structural (shared bias) rather than a genuine signal of retrieval quality.**
+
+Concretely: if Claude generated the hotel descriptions and Claude judges the results, both will tend to prefer documents that reflect Claude's internal sense of what "beach hotel" or "luxury spa" means. A retrieval method that happens to surface documents whose phrasing aligns with that internal representation will score well — not because it serves users better, but because it mirrors the generator.
+
+## Design requirements
+
+**Judge model must differ from the generator model.** Use a different provider or a provably independent model family (e.g., a Cohere or Mistral judge if Claude generated the data, or vice versa). Document the model choice and the reasoning in `EXPERIMENTS.md`.
+
+**Human-annotated held-out slice.** Collect a small set of queries written by a person who read the hotel documents but never saw the generation prompts or the golden dataset construction code. Evaluate all retrieval strategies on this human slice separately from the generated golden queries. The gap in relative method rankings between the two slices is the empirical size of the generator effect.
+
+**Do not replace the golden dataset.** LLM judge scores are an additional evaluation layer, not a replacement. The existing attribute-based golden dataset remains the primary metric for reproducibility. Report both.
+
+**Report statistical uncertainty.** At 62 generated queries and a small human slice, confidence intervals are wide. Every reported comparison must include an indication of the sample size per slice. Do not present method rankings as definitive if the slices are too small to support significance claims.
+
+## What to implement
+
+- `JudgeProvider` Protocol with at least two implementations:
+  - `EchoJudgeProvider` — returns a fixed score (for tests and dry runs)
+  - `BedrockJudgeProvider` — calls a Bedrock LLM (different family from the generator) with a structured scoring prompt; returns a score in [0, 3] and a brief rationale
+- A scoring prompt that presents the query, the hotel name, and the hotel description, asks for a relevance score (0 = irrelevant, 1 = somewhat relevant, 2 = relevant, 3 = highly relevant), and requests a one-sentence rationale. The prompt must not reveal that the data is synthetic.
+- `LLMEvaluator` — runs judge scoring over a set of (query, hit) pairs, computes per-query mean judge score, and compares against golden labels (Pearson/Spearman correlation, agreement rate at grade ≥ 2).
+- A human-annotated query file (`data/evaluation/human_queries.jsonl`) with a documented annotation guide (`docs/annotation_guide.md`). The annotation process must be described so a collaborator can independently produce judgments.
+- `scripts/evaluate_judge.py` — CLI that accepts `--strategy`, `--judge-provider`, `--slice` (generated | human | both), and outputs a comparison table with sample sizes and correlation coefficients.
+- A new `POST /evaluate/judge` API endpoint that runs judge scoring on a live search result set.
+- Makefile target: `make evaluate-judge`.
+
+## What to measure
+
+| Metric | Description |
+|---|---|
+| Mean judge score per strategy | Average LLM relevance score across all (query, hit) pairs at K |
+| Kendall's τ / Spearman ρ | Rank correlation between method ordering under golden labels vs LLM judge |
+| Label agreement rate | Fraction of (query, hotel) pairs where judge grade ≥ 2 matches golden grade ≥ 2 |
+| Generator-effect gap | Difference in relative method rankings between generated-query slice and human-query slice |
+
+## Methodology validity note
+
+Publish the judge model identity (provider, model ID, version) alongside every set of LLM judge results so readers can assess independence from the generator. If two evaluations use different judge models, their scores are not directly comparable — always report the judge identity.
+
+---
+
 # FastAPI
 
 Expose useful APIs.
@@ -898,6 +950,9 @@ Graph-enhanced retrieval prototype/concept.
 
 Milestone 15
 Production API, observability, resilience and final evaluation.
+
+Milestone 16
+LLM-as-judge evaluation: `JudgeProvider` abstraction, `BedrockJudgeProvider` (independent model family from the generator), `LLMEvaluator`, human-annotated held-out query slice, generator-effect measurement, and `POST /evaluate/judge` endpoint.
 
 ---
 

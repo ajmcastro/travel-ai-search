@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 15 — Production API, observability, resilience ✅ Complete
+## Current status: Milestone 16 — LLM-as-judge evaluation ✅ Complete
 
 | # | Milestone | Status |
 |---|---|---|
@@ -25,7 +25,8 @@ An educational, production-quality project demonstrating modern AI search archit
 | 12 | AWS Bedrock providers | ✅ Complete |
 | 13 | RAG / travel knowledge base | ✅ Complete |
 | 14 | Graph-enhanced retrieval prototype | ✅ Complete |
-| 15 | Production API, observability, resilience, final evaluation | ✅ **Complete** |
+| 15 | Production API, observability, resilience, final evaluation | ✅ Complete |
+| 16 | LLM-as-judge evaluation | ✅ **Complete** |
 
 ### Final evaluation results — BM25 vs Vector vs RRF vs Rerank vs Understand vs Rewrite vs Expand (K=10, 62 queries, 10 query classes)
 
@@ -50,6 +51,7 @@ An educational, production-quality project demonstrating modern AI search archit
 - RAG (M13) — destination knowledge base: 30 documents (one per island/region), stored in a separate `travel_destinations` OpenSearch index and retrieved semantically alongside hotel search. `POST /search` with `rag=true` returns `knowledge_context` (structured destination facts) and optionally `rag_summary` (LLM-synthesized recommendation). Hotel ranking is unchanged — RAG is purely additive.
 - Graph (M14) — in-memory destination graph: 38 nodes (30 destinations + 8 UK airports) and 309 edges built from the knowledge JSONL at startup. Two edge types: `SIMILAR_TO` (curated editorial similarity, bidirectional) and `FLIES_TO` (directed, airport → destination, with realistic long-haul hub restriction). Three exploration endpoints: `GET /graph/similar` (BFS SIMILAR_TO), `GET /graph/destinations` (FLIES_TO from airport), `GET /graph/airports` (reverse FLIES_TO). Demonstrates what graph traversal provides that vector search cannot: exact structural reachability and multi-hop curated similarity chains.
 - Observability (M15) — per-stage pipeline timing (`qu_took_ms`, `rewrite_took_ms`, `lexical_took_ms`, `vector_took_ms`, `reranking_took_ms`, `rag_took_ms`), structured request logging, in-memory Prometheus-compatible metrics (`GET /metrics`), deep health check (`GET /health`), and runtime resilience (rewriter fail → original query; embedding fail → BM25 fallback). 9 new resilience unit tests verify all fallback paths.
+- LLM-as-judge (M16) — `JudgeProvider` Protocol + `EchoJudgeProvider` (no AWS needed) + `BedrockJudgeProvider` (`amazon.nova-lite-v1:0` — different family from the Anthropic Claude generator, to avoid common-mode bias). `LLMEvaluator` scores each retrieved hotel 0–3 with a rationale. Spearman ρ and Kendall τ (from first principles) measure the generator-effect gap between synthetic and human-written query slices. 20 human-written queries in `data/evaluation/human_queries.jsonl`. `POST /evaluate/judge` endpoint + `make evaluate-judge` CLI.
 
 Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
@@ -192,6 +194,7 @@ Available endpoints:
 | `GET /search/hybrid?q=...` | Hybrid BM25 + vector (weighted-sum or RRF fusion) |
 | `POST /search` | Full pipeline: QU → optional rewriting → hybrid RRF → optional reranking |
 | `POST /query/understand` | Inspect query understanding extraction result |
+| `POST /evaluate/judge` | LLM-as-judge: score top-K hotels per query (0–3) with rationale |
 
 Example searches:
 
@@ -335,6 +338,8 @@ make typecheck          # mypy
 make serve              # FastAPI dev server
 make evaluate           # run BM25 evaluation against golden dataset
 make final-eval         # run final evaluation across all strategies + save results (Milestone 15)
+make evaluate-judge     # LLM-as-judge dry run (EchoJudge, rrf, generated slice)
+make evaluate-judge-all # LLM-as-judge: all strategies on both slices + generator-effect gap
 make generate-embeddings # generate dense embeddings for all hotels (Milestone 5+)
 ```
 

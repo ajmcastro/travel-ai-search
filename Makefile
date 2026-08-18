@@ -137,6 +137,14 @@ evaluate: ## Run search evaluation across all strategies  [Milestone 4+]
 final-eval: ## Run final evaluation across all strategies and save results  [Milestone 15]
 	uv run python scripts/evaluate.py --output data/evaluation/final_results.json
 
+.PHONY: evaluate-judge
+evaluate-judge: ## LLM-as-judge evaluation (EchoJudge, rrf, generated slice)  [Milestone 16]
+	uv run python scripts/evaluate_judge.py --strategy rrf --slice generated
+
+.PHONY: evaluate-judge-all
+evaluate-judge-all: ## LLM-as-judge: all strategies on both slices + generator-effect gap  [Milestone 16]
+	uv run python scripts/evaluate_judge.py --all-strategies --slice both
+
 # ── Help ───────────────────────────────────────────────────────────────────────
 
 .PHONY: help

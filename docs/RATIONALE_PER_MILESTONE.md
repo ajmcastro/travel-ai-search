@@ -1645,3 +1645,78 @@ The `/health` endpoint here functions as a readiness probe: it verifies OpenSear
 - **Persistent metrics across restarts**: in-memory metrics reset on each server restart — acceptable since the prototype demonstrates the pattern, not production operation.
 - **Separate `/health/live` and `/health/ready`**: a single `/health` endpoint covers both in this project; split only if deploying to Kubernetes with separate probe configurations.
 - **Graph-boosted ranking**: while it was identified in M14's "future work", integrating graph traversal into the scoring pipeline (rather than as standalone exploration endpoints) is beyond the educational scope of this project.
+
+---
+
+## Milestone 16 — LLM-as-judge evaluation
+
+### What we added
+
+A complete LLM-as-judge evaluation layer on top of the existing retrieval pipeline:
+
+- **`JudgeProvider` Protocol** (`evaluation/judge.py`) — runtime-checkable structural type that any judge must satisfy.  Records `model_id` alongside every result set so scores from different judge models are never silently mixed.
+- **`EchoJudgeProvider`** — fixed-score stub for tests and dry runs; requires no AWS credentials.
+- **`BedrockJudgeProvider`** (`evaluation/judge_bedrock.py`) — calls the Bedrock Converse API with `amazon.nova-lite-v1:0` by default.  The model family differs from the generator (Anthropic Claude) to avoid common-mode bias.
+- **`LLMEvaluator`** (`evaluation/judge_evaluator.py`) — runs retrieval, then asks the judge to score each (query, hotel) pair (0–3).  Produces `JudgeReport` objects with per-query `mean_score` and `agreement_rate`.
+- **`spearman_rho` and `kendall_tau`** — implemented from first principles (no `scipy`).  Used by `generator_effect_gap` to quantify whether strategy rankings agree between the generated and human query slices.
+- **`generator_effect_gap`** — measures the empirical size of the generator effect: how much the relative ranking of retrieval strategies changes between synthetic queries and human-written queries.
+- **`POST /evaluate/judge`** — HTTP endpoint that accepts a list of queries and returns scored results with the judge model identity in every response.
+- **`data/evaluation/human_queries.jsonl`** — 20 human-written queries across 10 query classes.
+- **`docs/annotation_guide.md`** — instructions for creating more human queries and optional relevance grades.
+- **`scripts/evaluate_judge.py`** — CLI for batch evaluation, generator-effect measurement, and optional JSON output.
+
+### Concepts
+
+#### LLM-as-judge
+
+Traditional IR evaluation requires human relevance assessors — expensive, slow, and not reproducible.  LLM-as-judge replaces the human assessor with a language model.  Given a (query, hotel_name, hotel_description) triple, the judge reads both and outputs a score and a rationale.
+
+The output format `"SCORE: N | RATIONALE: ..."` is deliberately strict: it is parseable by regex, and the rationale string allows qualitative inspection of why the judge scored each hotel the way it did.  The parser falls back gracefully: strict regex first, then digit scan, then `fallback_score=0`.
+
+#### Common-mode bias
+
+If the model family that generated the hotel descriptions is the **same** as the judge, their agreement is partly structural rather than a genuine relevance signal.  Both models share the same vocabulary biases, notions of "good hotel prose", and internal knowledge representations.  The agreement metric inflates, but the inflation reflects model architecture, not retrieval quality.
+
+**Fix**: always use a different model family for the judge.  In this project, the generator is Anthropic Claude (via `BedrockLLMProvider`); the judge defaults to Amazon Nova Lite.  The `model_id` attribute on every `JudgeProvider` is a guard: if someone accidentally wires up an Anthropic model as the judge, the `model_id` in the results makes the mistake auditable.
+
+#### Generator effect
+
+Dense retrieval benefits from synthetic paraphrase consistency.  Embedding models collapse semantically equivalent sentences into nearby positions.  When both corpus and queries come from the same synthetic pipeline, the embedding model's strengths are artificially aligned with the data distribution.  The measured NDCG advantage of vector over BM25 may be larger on synthetic data than on real-world data written by varied authors.
+
+The generator-effect gap is measured by running the same strategies on two query slices — generated golden queries and human-written queries — and computing Spearman ρ between the strategy rankings.  ρ ≈ 1 means both slices agree; ρ < 0.7 indicates a meaningful gap worth investigating.
+
+#### Spearman ρ and Kendall τ (from first principles)
+
+Both metrics measure rank correlation: how consistently two signals order the same items.
+
+- **Spearman ρ**: converts raw scores to ranks (with average-rank tie handling), then computes Pearson correlation on the ranks.  Range [−1, 1].  Sensitive to monotone relationship, not just concordance.
+- **Kendall τ-b**: counts concordant pairs (both agree on which strategy wins) minus discordant pairs, divided by the geometric mean of pairs not tied on each axis.  More robust when there are many ties (as there are when comparing only 2–3 strategies).
+
+Neither requires `scipy` — the implementations follow the standard formulae directly, consistent with the project's philosophy of implementing core IR concepts from first principles.
+
+#### JudgeFn vs SearchFn
+
+The existing evaluation framework uses `SearchFn = Callable[[str, int, dict], list[str]]` — returning doc IDs only.  The judge needs `hotel_name` and `hotel_description` from each hit to construct the scoring prompt.  Fetching those fields with a second OpenSearch lookup would add latency and coupling.  Instead, a new type `JudgeFn = Callable[[str, int, dict], list[Hit]]` returns full `Hit` objects (including `hit.source`), so the evaluator can access the hotel content directly.
+
+#### Human-annotated held-out slice
+
+The 20 human queries were written by a person who read the hotel descriptions but never saw the generation code or prompts.  This independence is the defining property: the human slice cannot have vocabulary biases that favour any particular retrieval mechanism.  Combined with the generated slice, it allows the generator effect to be measured empirically rather than assumed.
+
+### Design decisions
+
+| Decision | Chosen | Rejected | Reason |
+|---|---|---|---|
+| Judge model default | `amazon.nova-lite-v1:0` (Amazon Nova family) | Any Anthropic Claude model | Different family from the Anthropic Claude generator — avoids common-mode bias |
+| Output format | `"SCORE: N \| RATIONALE: ..."` strict regex | Free-form text | Parseable and inspectable without a second LLM call; fallback digit scan handles minor non-compliance |
+| Correlation implementation | From first principles (`spearman_rho`, `kendall_tau`) | `scipy.stats.spearmanr` | Consistent with the project's educational philosophy; no new dependency |
+| Prompt system turn | `_JUDGE_SYSTEM_PROMPT` separate from user content | Single combined prompt | Bedrock Converse API supports system/user separation; a clear system identity improves instruction-following |
+| JudgeFn return type | `list[Hit]` (full source dict) | `list[str]` (doc IDs only) | Judge needs `hotel_name` + `hotel_description`; avoiding a second OpenSearch lookup reduces latency and coupling |
+| Agreement rate | `float \| None` (None when no golden labels) | Always return 0.0 | Human queries have no pre-annotated labels; returning `None` makes the absence explicit rather than hiding it as a zero |
+| Fallback on judge error | `JudgeVerdict(score=0, rationale=f"[error] {exc}")` | Raise exception | Evaluation runs should not abort on a single LLM call failure; a score=0 is conservative (worst case) |
+
+### What was not done and why
+
+- **Fine-grained per-query human relevance grades**: the `data/evaluation/human_queries.jsonl` file contains queries only; relevance grades are optional (see `docs/annotation_guide.md`).  Annotation takes 2–4 hours and is left for the operator to do when needed.
+- **`scipy` or `statsmodels` dependency**: standard Spearman and Kendall implementations are available in those libraries, but adding a dependency for ~80 lines of arithmetic is not justified in an educational project.
+- **Judge temperature control**: the Bedrock Converse API allows `inferenceConfig.temperature`; keeping it at the default (slightly above 0) is sufficient for this prompt structure.  Explicit temperature 0 would be preferable for reproducible scoring in a production setting.
+- **Batched LLM calls**: scoring each (query, hotel) pair individually is slow for large slices but straightforward to understand and debug.  A production implementation would batch multiple judgments per API call.

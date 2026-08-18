@@ -134,6 +134,16 @@ class Settings(BaseSettings):
     graph_enabled: bool = True
     knowledge_file_path: str = "data/knowledge/destinations.jsonl"
 
+    # LLM-as-judge evaluation (Milestone 16)
+    # judge_provider: "echo" (fixed score, no API call) or "bedrock".
+    #   Always defaults to "echo" so the pipeline works without AWS credentials.
+    # bedrock_judge_model_id: the judge model MUST differ from bedrock_llm_model_id
+    #   to avoid common-mode bias.  Default is Amazon Nova Lite (distinct from Claude).
+    #   Other independent options: mistral.mistral-large-2402-v1:0
+    #                              meta.llama3-70b-instruct-v1:0
+    judge_provider: str = "echo"
+    bedrock_judge_model_id: str = "amazon.nova-lite-v1:0"
+
 
 @lru_cache
 def get_settings() -> Settings:

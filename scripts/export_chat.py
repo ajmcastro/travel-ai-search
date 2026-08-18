@@ -194,9 +194,7 @@ def main() -> None:
     out.write_text(render_markdown(sessions), encoding="utf-8")
 
     total_turns = sum(len(t) for _, t in sessions)
-    print(
-        f"export_chat.py: {total_turns} turns from {len(sessions)} session(s) → {out}"
-    )
+    print(f"export_chat.py: {total_turns} turns from {len(sessions)} session(s) → {out}")
 
 
 if __name__ == "__main__":

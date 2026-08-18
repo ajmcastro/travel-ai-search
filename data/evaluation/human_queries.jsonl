@@ -1,0 +1,20 @@
+{"query_id": "hq001", "query_text": "beach holiday with kids somewhere sunny", "query_class": "family", "source": "human"}
+{"query_id": "hq002", "query_text": "romantic getaway for two adults", "query_class": "adults_couples", "source": "human"}
+{"query_id": "hq003", "query_text": "something cheap but decent for a summer break", "query_class": "budget", "source": "human"}
+{"query_id": "hq004", "query_text": "vibrant resort with good nightlife and beach", "query_class": "nightlife", "source": "human"}
+{"query_id": "hq005", "query_text": "peaceful retreat away from the crowds", "query_class": "quiet_peaceful", "source": "human"}
+{"query_id": "hq006", "query_text": "holiday in Tenerife", "query_class": "exact_destination", "source": "human"}
+{"query_id": "hq007", "query_text": "watersports and diving holiday in warm waters", "query_class": "activities", "source": "human"}
+{"query_id": "hq008", "query_text": "five star spa hotel luxury break", "query_class": "luxury", "source": "human"}
+{"query_id": "hq009", "query_text": "family holiday in October half term all inclusive", "query_class": "multi_constraint", "source": "human"}
+{"query_id": "hq010", "query_text": "adults only no children pool bar", "query_class": "adults_couples", "source": "human"}
+{"query_id": "hq011", "query_text": "Algarve beach break Portugal", "query_class": "exact_destination", "source": "human"}
+{"query_id": "hq012", "query_text": "somewhere with amazing food and local culture", "query_class": "natural_language", "source": "human"}
+{"query_id": "hq013", "query_text": "island holiday with turquoise sea and few tourists", "query_class": "quiet_peaceful", "source": "human"}
+{"query_id": "hq014", "query_text": "cheap 4 star hotel with good reviews", "query_class": "budget", "source": "human"}
+{"query_id": "hq015", "query_text": "hiking and adventure holiday in the mountains", "query_class": "activities", "source": "human"}
+{"query_id": "hq016", "query_text": "family resort Fuerteventura with waterpark", "query_class": "family", "source": "human"}
+{"query_id": "hq017", "query_text": "relaxing holiday under 1000 pounds", "query_class": "budget", "source": "human"}
+{"query_id": "hq018", "query_text": "boutique hotel with pool and stunning views", "query_class": "luxury", "source": "human"}
+{"query_id": "hq019", "query_text": "Santorini Greece romantic holiday", "query_class": "exact_destination", "source": "human"}
+{"query_id": "hq020", "query_text": "something different off the beaten track with history", "query_class": "natural_language", "source": "human"}

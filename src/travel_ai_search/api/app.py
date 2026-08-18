@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from travel_ai_search.api.routes import evaluate as evaluate_router
 from travel_ai_search.api.routes import graph as graph_router
 from travel_ai_search.api.routes import health as health_router
 from travel_ai_search.api.routes import query as query_router
@@ -320,6 +321,7 @@ app.include_router(search_router.router, prefix="/search")
 app.include_router(query_router.router, prefix="/query")
 app.include_router(graph_router.router, prefix="/graph")
 app.include_router(health_router.router, prefix="/health")
+app.include_router(evaluate_router.router, prefix="/evaluate")
 
 
 @app.get("/metrics", tags=["Observability"], include_in_schema=False)
