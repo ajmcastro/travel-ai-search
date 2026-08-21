@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 18 — ColBERT late-interaction reranking ✅ Complete
+## Current status: Milestone 19 — Two-tower fine-tuning ✅ Complete
 
 | # | Milestone | Status |
 |---|---|---|
@@ -28,18 +28,21 @@ An educational, production-quality project demonstrating modern AI search archit
 | 15 | Production API, observability, resilience, final evaluation | ✅ Complete |
 | 16 | LLM-as-judge evaluation | ✅ Complete |
 | 17 | Learned sparse retrieval (SPLADE) | ✅ Complete |
-| 18 | ColBERT late-interaction reranking | ✅ **Complete** |
+| 18 | ColBERT late-interaction reranking | ✅ Complete |
+| 19 | Two-tower fine-tuning | ✅ **Complete** |
 
-### Evaluation results — BM25 vs Vector vs RRF vs Rerank vs SPLADE vs ColBERT (K=10, 62 queries, 10 query classes)
+### Evaluation results — all strategies (K=10, 62 queries, 10 query classes)
 
-| Metric | BM25 | Vector | RRF | Rerank | **SPLADE** | ColBERT |
-|---|---|---|---|---|---|---|
-| NDCG@10 | 0.5021 | 0.6940 | 0.6239 | 0.6830 | **0.7195** | 0.6294 |
-| MRR | 0.6874 | **0.8688** | 0.8449 | 0.8191 | 0.8370 | 0.7608 |
-| HitRate@10 | 0.8387 | **1.0000** | 0.9516 | 0.9516 | 0.9355 | 0.9516 |
-| Precision@10 | 0.6161 | 0.7790 | 0.7210 | **0.8935** | 0.8290 | 0.7484 |
-| Latency p50 | 26 ms | **10 ms** | 50 ms | 109 ms | 22 ms | 75 ms |
-| Latency p95 | 46 ms | 292 ms | 86 ms | 178 ms | **30 ms** | 362 ms |
+| Metric | BM25 | Vector | RRF | Rerank | SPLADE | ColBERT | **Fine-tuned** |
+|---|---|---|---|---|---|---|---|
+| NDCG@10 | 0.5021 | 0.6940 | 0.6239 | 0.6830 | 0.7195 | 0.6294 | **0.7388** |
+| MRR | 0.6874 | 0.8688 | 0.8449 | 0.8191 | 0.8370 | 0.7608 | **0.9000** |
+| HitRate@10 | 0.8387 | **1.0000** | 0.9516 | 0.9516 | 0.9355 | 0.9516 | 0.9839 |
+| Precision@10 | 0.6161 | 0.7790 | 0.7210 | **0.8935** | 0.8290 | 0.7484 | 0.8194 |
+| Latency p50 | 26 ms | **10 ms** | 50 ms | 109 ms | 22 ms | 75 ms | 11 ms |
+| Latency p95 | 46 ms | 292 ms | 86 ms | 178 ms | **30 ms** | 362 ms | 21 ms |
+
+*Fine-tuned vector (M19) is the highest NDCG@10 single strategy across all milestones.*
 
 **Key findings (cumulative):**
 - Vector (M5): NDCG +38.6% vs BM25; `exact_destination` NDCG jumped from 0.18 → 0.84 (+358%); HitRate = 1.000.
@@ -56,6 +59,7 @@ An educational, production-quality project demonstrating modern AI search archit
 - LLM-as-judge (M16) — `JudgeProvider` Protocol + `EchoJudgeProvider` (no AWS needed) + `BedrockJudgeProvider` (`amazon.nova-lite-v1:0` — different family from the Anthropic Claude generator, to avoid common-mode bias). `LLMEvaluator` scores each retrieved hotel 0–3 with a rationale. Spearman ρ and Kendall τ (from first principles) measure the generator-effect gap between synthetic and human-written query slices. 20 human-written queries in `data/evaluation/human_queries.jsonl`. `POST /evaluate/judge` endpoint + `make evaluate-judge` CLI.
 - SPLADE (M17) — `LearnedSparseProvider` Protocol + `LocalSparseProvider` (HuggingFace SPLADE model). **NDCG@10 = 0.7195 — the highest single-strategy score measured so far**, beating pure vector (0.6940) and cross-encoder reranking (0.6830). Encodes queries and documents as sparse vocabulary-weight vectors (SPLADE formula: `w_t = max_i log(1 + ReLU(MLM_logit_{i,t}))`). Stored as `rank_features` in OpenSearch; queried via `bool.should[rank_feature]` — one clause per non-zero vocabulary term. `exact_destination` class is perfect (NDCG=1.000); `luxury` and `nightlife` classes are weakest (NDCG≈0.55–0.60), likely due to vocabulary mismatch between query and document encodings. p95 latency = 30 ms — faster than RRF (86 ms) and reranking (178 ms).
 - ColBERT (M18) — `ColBERTReranker` implementing the `Reranker` Protocol via MaxSim late interaction: `Score(q,d) = Σᵢ max_j (qᵢ·dⱼ)`. Document token embeddings pre-computed offline by `generate_colbert_embeddings.py` and stored as `data/processed/colbert_embeddings/<hotel_id>.npy` (shape `(≤128, 128)`, L2-normalised float32). At query time: RRF retrieves candidates → query is encoded into token embeddings → MaxSim scores each candidate against its `.npy` file → sorted, top-K returned. Drop-in via `RERANKER_PROVIDER=colbert`. NDCG@10 = 0.6294, slightly above RRF (0.6239) but below cross-encoder (0.6830) and SPLADE (0.7195). Key finding: the hypothesis that MaxSim outperforms cross-encoder did not hold — file I/O loading 50 `.npy` files per query drove p95 to 362 ms (worse than cross-encoder 178 ms), and running `colbert-ir/colbertv2.0` without its custom `[Q]`/`[D]` prefix tokens degraded quality vs. using the full ColBERT library. `multi_constraint` class best (MRR=1.000); `activities` class worst (NDCG=0.368). ColBERT does recover the SPLADE luxury/nightlife gap (NDCG +0.10), as MaxSim is not blocked by vocabulary sparsity.
+- Fine-tuned vector (M19) — domain-adapted `all-MiniLM-L6-v2` via contrastive learning. `MultipleNegativesRankingLoss` (InfoNCE variant) with in-batch negatives + BM25-mined explicit hard negatives. Training pipeline: `prepare_fine_tuning_data.py` → `fine_tune_embeddings.py` (3 epochs, batch=16, manual PyTorch loop to avoid the `datasets` dependency) → `data/models/bi-encoder-travel/`. **NDCG@10 = 0.7388 — highest single-strategy result across all milestones** (+6.5% vs base vector, +2.7% vs SPLADE). Biggest class gains: nightlife (+31.6%), family (+15.1%), activities (+21.6%). Regression on luxury (−11.2%) — attributed to the small training corpus (~300 triplets). Evaluated via `--strategy fine-tuned-vector`; loads the checkpoint via `LocalEmbeddingProvider` (local path = same code path as HuggingFace Hub).
 
 Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 

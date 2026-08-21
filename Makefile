@@ -185,6 +185,26 @@ generate-colbert-embeddings: ## Generate ColBERT token embeddings for all hotels
 evaluate-colbert: ## Evaluate ColBERT late-interaction reranking against the golden dataset  [Milestone 18]
 	uv run python scripts/evaluate.py --strategy colbert
 
+# ── Two-tower fine-tuning (Milestone 19) ──────────────────────────────────────
+# 1. Mine hard negatives from BM25 and write training triplets (requires OpenSearch):
+#      make prepare-fine-tuning-data
+# 2. Fine-tune the bi-encoder with MultipleNegativesRankingLoss:
+#      make fine-tune-embeddings
+# 3. Evaluate the fine-tuned model (set FINE_TUNED_EMBEDDING_MODEL_PATH in .env first):
+#      make evaluate-fine-tuned
+
+.PHONY: prepare-fine-tuning-data
+prepare-fine-tuning-data: ## Mine BM25 hard negatives and write training triplets  [Milestone 19]
+	uv run python scripts/prepare_fine_tuning_data.py
+
+.PHONY: fine-tune-embeddings
+fine-tune-embeddings: ## Fine-tune the bi-encoder with contrastive learning  [Milestone 19]
+	uv run python scripts/fine_tune_embeddings.py
+
+.PHONY: evaluate-fine-tuned
+evaluate-fine-tuned: ## Evaluate the fine-tuned bi-encoder against the golden dataset  [Milestone 19]
+	uv run python scripts/evaluate.py --strategy fine-tuned-vector
+
 # ── Help ───────────────────────────────────────────────────────────────────────
 
 .PHONY: help

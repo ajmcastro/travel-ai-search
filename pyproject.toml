@@ -58,6 +58,8 @@ select = ["E", "F", "I", "UP"]
 "scripts/create_index.py" = ["E402"]
 "scripts/evaluate.py" = ["E402"]
 "scripts/healthcheck.py" = ["E402"]
+"scripts/prepare_fine_tuning_data.py" = ["E402"]
+"scripts/fine_tune_embeddings.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.12"

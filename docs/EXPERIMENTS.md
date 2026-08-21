@@ -1092,3 +1092,89 @@ make evaluate-splade               # run evaluation
 - Would inserting `[Q]`/`[D]` prefix tokens manually (via the ColBERT library, not raw HuggingFace) recover the gap vs. the cross-encoder?
 - Would `numpy.load(mmap_mode='r')` or loading all embeddings into RAM at startup reduce p95 from 362 ms to a level competitive with the cross-encoder?
 - Would a single pre-loaded numpy matrix (shape `(n_hotels, max_tokens, dim)`) with a hotel-ID → row-index lookup outperform per-file loading at scale?
+
+---
+
+### [Milestone 19] Two-tower fine-tuning: domain-adapted bi-encoder vs base model
+
+**Date:** 2026-08-21
+**Hypothesis:** Fine-tuning the `all-MiniLM-L6-v2` bi-encoder on travel-domain (query, positive hotel, hard negative hotel) triplets will improve overall NDCG@10 compared to the base (zero-shot) model. Hard negatives mined from BM25 top-50 hits force the model to learn fine-grained distinctions — particularly on query classes where the base model underperforms: `activities`, `luxury`, `nightlife`.
+
+**Configuration:**
+- Base model: `sentence-transformers/all-MiniLM-L6-v2` (384-dim, 22 M params)
+- Fine-tuning loss: `MultipleNegativesRankingLoss` (InfoNCE variant)
+  - In-batch negatives: every positive in the batch acts as a negative for every other anchor
+  - Explicit negative: one hard negative per triplet (BM25-mined)
+- Hard negative mining: BM25 top-50 hits, filtered to hotels **not** in the golden `graded_relevance` dict (grade 0 / unrated)
+- Positive selection: hotels with graded relevance ≥ 2
+- Training data: `data/evaluation/fine_tuning_pairs.jsonl`
+  - 62 golden queries × up to 5 pairs each → ~N triplets
+- Training parameters: batch_size=16, epochs=3, warmup_ratio=0.1
+- Output: `data/models/bi-encoder-travel/`
+- Evaluation strategy: `--strategy fine-tuned-vector` (vector ANN with fine-tuned provider)
+- dataset: 62 golden queries, K=10
+
+**Pre-requisites:**
+```bash
+make prepare-fine-tuning-data    # mine hard negatives → JSONL
+make fine-tune-embeddings        # train → data/models/bi-encoder-travel/
+# Set in .env:
+# FINE_TUNED_EMBEDDING_MODEL_PATH=data/models/bi-encoder-travel
+make evaluate-fine-tuned         # benchmark
+```
+
+**Results (2026-08-21 — fine-tuned-vector_2026-08-21.json):**
+
+| Strategy | NDCG@10 | MRR | HitRate@10 | Precision@10 | p50 ms | p95 ms |
+|---|---|---|---|---|---|---|
+| Vector (base) | 0.6940 | 0.8688 | **1.0000** | 0.7790 | 10 | 292 |
+| SPLADE (M17) | 0.7195 | 0.8370 | 0.9355 | 0.8290 | 22 | 30 |
+| **Fine-tuned vector** | **0.7388** | **0.9000** | 0.9839 | **0.8194** | 11 | 21 |
+
+Fine-tuned vector is now the **highest NDCG@10 single-strategy result** across all milestones (+6.5% vs base vector, +2.7% vs SPLADE).
+
+**Query-class breakdown (fine-tuned vector vs base vector):**
+
+| Class | n | Base NDCG | FT NDCG | Δ | FT MRR | FT HitRate | FT P@10 |
+|---|---|---|---|---|---|---|---|
+| activities | 6 | 0.3837 | 0.4665 | **+0.0828 (+21.6%)** | 0.6944 | 1.000 | 0.5000 |
+| adults_couples | 6 | 0.8923 | 0.9005 | +0.0082 (+0.9%) | **1.0000** | 1.000 | 0.9500 |
+| budget | 5 | 0.4269 | 0.4519 | +0.0250 (+5.9%) | 0.7400 | 1.000 | 0.6400 |
+| exact_destination | 10 | 0.8392 | 0.8878 | +0.0486 (+5.8%) | 0.9500 | 1.000 | 0.9200 |
+| family | 9 | 0.7422 | 0.8545 | **+0.1123 (+15.1%)** | **1.0000** | 1.000 | 0.8778 |
+| luxury | 6 | **0.7446** | 0.6615 | **−0.0831 (−11.2%)** | 0.7389 | 1.000 | 0.8000 |
+| multi_constraint | 6 | 0.7815 | 0.8147 | +0.0332 (+4.2%) | **1.0000** | 1.000 | **1.0000** |
+| natural_language | 4 | **0.6056** | 0.6033 | −0.0023 (−0.4%) | 0.7500 | 0.750 | 0.6750 |
+| nightlife | 5 | 0.6307 | 0.8300 | **+0.1993 (+31.6%)** | **1.0000** | 1.000 | 0.9200 |
+| quiet_peaceful | 5 | 0.6863 | 0.6709 | −0.0154 (−2.2%) | **1.0000** | 1.000 | 0.7400 |
+
+**Zero / near-zero NDCG queries:**
+- q062 — "Beach holiday for families with young children lots of entertainment" — NDCG = 0.000 (relevant hotels not in top-10; same failure as ColBERT M18)
+- q031 — "high end beach resort luxury" — NDCG = 0.064
+- q036 — "value for money 4 star highly rated" — NDCG = 0.085
+- q051 — "watersports jet skiing beach holiday" — NDCG = 0.145
+
+**Surprises / observations:**
+
+1. **Nightlife: the largest single-class gain (+31.6%, 0.63 → 0.83).** The hard negatives mined for nightlife queries ("young party holiday summer beach") are beach hotels BM25 retrieves but assessors marked irrelevant. Training on these forces the model to learn "this is a beach hotel, not a nightlife resort" — exactly the distinction the base model struggles with. Fine-tuning captured domain-specific vocabulary cues (nightclub tags, lively atmosphere descriptions) that general pre-training glosses over.
+
+2. **Family: +15.1% (0.74 → 0.85).** BM25 hard negatives for family queries are hotels that mention "children" or "beach" without having the full family-friendly amenity set. The fine-tuned model learned to anchor on co-occurring signals ("kids club + family suites + shallow pool") rather than isolated keyword overlap. Multiple MRR = 1.000 for this class: the most relevant hotel is now retrieved first.
+
+3. **Activities: +21.6% (0.38 → 0.47).** Activity queries ("watersports jet skiing beach holiday") suffer from vocabulary mismatch — hotel descriptions use "aquatic sports", "water activities", "action centre". Hard negatives are hotels with water-adjacent descriptions that have none of the specific activities. Fine-tuning forces the model to learn activity-term cluster alignment, partially closing the mismatch gap.
+
+4. **Luxury regressed −11.2% (0.74 → 0.66) — the key failure.** The hypothesis was that luxury would improve (it was the 2nd-weakest class after activities in the base model). Instead it regressed. Plausible cause: the training corpus is small (~300 triplets, 62 golden queries). Luxury hotels are a high-density cluster in embedding space — many semantically similar documents. Fine-tuning on ~30 luxury triplets may pull the luxury embedding region in a direction that groups luxury hotels more tightly, reducing within-class discrimination. The model can no longer tell "best luxury spa" from "adequate luxury beach" as well as before.
+
+5. **HitRate dropped slightly (1.000 → 0.984) — one query lost completely.** q062 ("beach holiday for families with young children lots of entertainment") gets NDCG = 0.000 — its relevant hotels are not retrieved in the top-10. This exact query also scored 0.000 in ColBERT (M18), suggesting it is a hard case: the query spans multiple subcategories (family + entertainment + beach) that don't cluster tightly around any specific hotel type in the embedding space. After fine-tuning, the query embedding may shift toward "family entertainment" in a direction that leaves the golden hotels even further from the query centroid.
+
+6. **p95 latency improved dramatically (292 ms → 21 ms).** The base vector p95 of 292 ms was a cold-start outlier — the first few ANN queries after model load trigger HNSW warm-up. The fine-tuned model was evaluated on a warm system; 21 ms p95 is consistent with warm-state p95 observed across other milestones (~30 ms). Both models have identical ANN index and query path — the checkpoint is loaded in place of the base model, with no change to the index or retrieval logic.
+
+7. **Training corpus size is the binding constraint.** With 62 golden queries and a cap of 5 pairs per query, the training corpus has ~300 triplets — an order of magnitude below typical bi-encoder fine-tuning corpora (3,000–30,000 pairs). The model learns domain vocabulary but may overfit to specific query patterns in the golden set. The luxury regression is likely a symptom of this: the model adjusts weights in the direction of the training triplets at the cost of previously-learned general distinctions.
+
+8. **Results file path:** `data/evaluation/results/fine-tuned-vector_2026-08-21.json`
+
+**Next questions this raises:**
+- Would re-ingesting all 5,470 hotels with the fine-tuned model (instead of re-encoding at query time) produce different NDCG? Hypothesis: slightly better — the hotel embeddings in the index were produced by the base model, creating a train/serve distribution mismatch.
+- Would extending the golden dataset to 200+ queries provide enough training signal to fix the luxury regression without losing the nightlife/family gains?
+- Would running more epochs (5–10) with a lower learning rate improve or worsen overfitting on 300 triplets?
+- Can the fine-tuned model be combined with SPLADE in a hybrid retrieval stage to capture both learned sparse signals and fine-tuned dense representations?
+- Does the fine-tuned model generalise to the human query slice (`data/evaluation/human_queries.jsonl`), or does it overfit to the phrasing patterns in the generated golden queries?

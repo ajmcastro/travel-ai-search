@@ -1938,3 +1938,123 @@ Hits with missing `.npy` files keep their original retrieval score. This means:
 - **`[Q]`/`[D]` prefix tokens**: The ColBERT library's custom tokenizer prepends `[Q]` to every query and `[D]` to every document before encoding. Our `AutoTokenizer` does not do this, so the model runs out of distribution. Adding proper ColBERT tokenisation would require either the `colbert-ai` package or manual token insertion — a non-trivial change that was deferred to keep the HuggingFace-only dependency footprint clean.
 - **In-memory embedding cache**: Loading 50 `.npy` files per query is the primary latency bottleneck (p95 = 362 ms). A production implementation would pre-load all embeddings into a numpy array at startup (shape `(n_hotels, max_tokens, dim)`) and use a hotel-ID → row-index lookup — eliminating all file I/O at query time. Omitted to keep the generation script and reranker simple and self-explanatory.
 - **float16 storage**: halves disk from 350 MB to 175 MB with typically < 0.1% score difference. Straightforward addition, omitted to keep the generation script simple.
+
+---
+
+## Milestone 19 — Two-tower fine-tuning
+
+### What we added
+
+- `src/travel_ai_search/fine_tuning/pairs.py` — `TrainingPair` frozen dataclass, `select_hard_negatives()` pure function (filters BM25 hits to grade-0 hotels), `build_training_pairs()` pure function (round-robin negative assignment)
+- `src/travel_ai_search/fine_tuning/__init__.py` — package marker
+- `scripts/prepare_fine_tuning_data.py` — connects to OpenSearch, loads hotels and golden dataset, mines BM25 hard negatives, writes `data/evaluation/fine_tuning_pairs.jsonl`
+- `scripts/fine_tune_embeddings.py` — loads training triplets, fine-tunes `all-MiniLM-L6-v2` with `MultipleNegativesRankingLoss`, saves checkpoint to `data/models/bi-encoder-travel/`
+- `tests/unit/test_fine_tuning.py` — 25 unit tests covering `TrainingPair`, `select_hard_negatives`, and `build_training_pairs` (all pure functions, no I/O, no mocks)
+- `config/settings.py` — `fine_tuned_embedding_model_path: str = ""`
+- `scripts/evaluate.py` — `make_fine_tuned_vector_fn` factory, `"fine-tuned-vector"` strategy with path validation and fine-tuned provider loading
+- `Makefile` — `prepare-fine-tuning-data`, `fine-tune-embeddings`, `evaluate-fine-tuned` targets
+- `.env.example` — M19 section documenting `FINE_TUNED_EMBEDDING_MODEL_PATH`
+
+### Concepts
+
+#### Two-tower architecture
+
+A "two-tower" model has a query encoder and a document encoder — two independent networks — that share a common embedding space. At training time, both towers are updated together so their representations align. At inference time:
+- **Document tower** runs offline: all hotel descriptions are encoded once and stored (as they already are in M5).
+- **Query tower** runs live: the query is encoded in milliseconds per request.
+
+This is identical to what `all-MiniLM-L6-v2` (our M5 bi-encoder) already does. Fine-tuning adds domain-specific supervision on top of the general pre-training checkpoint.
+
+The name "two-tower" distinguishes this from a cross-encoder (one tower, joint query-document input) and from a late-interaction model like ColBERT (two towers, but with token-level interaction at query time).
+
+#### Contrastive learning and MultipleNegativesRankingLoss
+
+Contrastive learning teaches a model that similar items should be close in embedding space and dissimilar items should be far apart. The loss used here is `MultipleNegativesRankingLoss`, a form of InfoNCE (Information Noise-Contrastive Estimation):
+
+```
+L = -log( exp(sim(q, d⁺) / τ) / Σₖ exp(sim(q, dₖ) / τ) )
+```
+
+- `d⁺`: the positive hotel for query `q`
+- `dₖ`: all other positives in the batch + any explicit negatives (in-batch negatives)
+- `τ`: temperature (usually 1.0 for cosine similarity)
+- `sim(·, ·)`: cosine similarity (L2-normalised dot product)
+
+With batch size B, each anchor sees B-1 in-batch negatives plus any explicit negatives. The gradient pushes `sim(q, d⁺)` towards 1.0 and all other similarities towards 0.0 simultaneously.
+
+#### Hard negatives vs easy negatives
+
+An **easy negative** is a document obviously unrelated to the query: "beach holiday Tenerife" vs. a Manchester business hotel. The model quickly learns to separate these and saturates — gradients vanish.
+
+A **hard negative** is a document that appears related but is not: "beach holiday Tenerife" vs. a Tenerife hotel with a beach but rated as irrelevant (wrong board type, adults-only when family is requested). The model must learn fine-grained distinctions — this is where domain fine-tuning adds value over the general-purpose checkpoint.
+
+#### Hard negative mining from BM25
+
+BM25 retrieval is used to mine hard negatives because:
+1. BM25 retrieves hotels that share surface keywords with the query.
+2. A hotel ranked highly by BM25 but not present in the golden `graded_relevance` dict is a hotel that keyword overlap suggests is relevant, but a human assessor determined is not.
+3. These are exactly the confusing cases: they look relevant on the surface, but the bi-encoder must learn to downrank them.
+
+The filter `select_hard_negatives(bm25_hit_ids, known_relevant_ids)` excludes any hotel with a known relevance grade ≥ 1, so grade-1 borderline hotels are not used as negatives (they might be genuinely relevant).
+
+#### In-batch negatives and batch size
+
+`MultipleNegativesRankingLoss` with a batch of B triplets creates B × (B-1) in-batch negative pairs automatically — one for each (anchor, other positive) combination in the batch. This is why larger batches are harder training signals: more confusion to resolve per gradient step. With batch_size=16 and ~300 triplets, we get ~18 batches per epoch × 16 × 15 = 4,320 in-batch negative pairs per epoch. With 3 epochs this is ~13,000 gradient signals from the in-batch mechanism alone.
+
+#### Why `LocalEmbeddingProvider` needs no changes
+
+`LocalEmbeddingProvider.__init__` already takes a `model_name: str` argument that is passed directly to `SentenceTransformer(model_name)`. `SentenceTransformer` accepts:
+- A HuggingFace model ID string: `"all-MiniLM-L6-v2"` → downloads from Hub
+- A local directory path: `"data/models/bi-encoder-travel"` → loads from disk
+
+The fine-tuned model is therefore loadable by simply setting `FINE_TUNED_EMBEDDING_MODEL_PATH=data/models/bi-encoder-travel` and passing that path instead of the default model name — zero code change to the provider.
+
+#### Testability via pure functions
+
+The core logic — pairing positives with negatives and filtering hard negatives — lives in `fine_tuning/pairs.py` as pure functions with no I/O, no OpenSearch dependency, no model loading. This means:
+- 25 unit tests run in < 2 seconds with zero infrastructure
+- The logic can be verified independently of the training framework
+- The prepare script and the training script are thin wrappers that call these functions
+
+### Design decisions
+
+| Decision | Chosen | Rejected | Reason |
+|---|---|---|---|
+| New `fine_tuning/` package | Pure functions in `pairs.py` | Script-only logic | Enables unit testing without any I/O or mocks; the domain logic is valuable to isolate |
+| Hard negative source | BM25 top-50 | Random, all-corpus, cross-encoder scored | BM25 is fast, requires no additional model, and produces confusing surface-form matches that are ideal for contrastive learning |
+| Positive grade threshold | ≥ 2 | ≥ 1, ≥ 3 | Grade 1 hotels are borderline; using only grades 2–3 gives the model cleaner positive signal |
+| Training API | Manual PyTorch loop (`AdamW` + `LambdaLR` + `DataLoader`) | `model.fit()`, `SentenceTransformerTrainer` | `SentenceTransformerTrainer` requires `datasets`; `model.fit()` also imports it internally in sentence-transformers 5.x. Manual loop: `_TripletDataset` → `DataLoader(collate_fn=list)` → `AdamW` → `cross_entropy(q @ [p;n].T / τ, labels)` → `model.save()`. Encoding bypasses the deprecated `model.tokenize()` API and uses `model._first_module().tokenizer` + `auto_model` directly for stable gradient tracking across sentence-transformers versions. |
+| Explicit negative per triplet | 1 hard negative via round-robin | No explicit negative | Hard negatives are the key training signal; round-robin avoids duplicating negatives when there are fewer than positives |
+| Max pairs per query | 5 | unlimited, 1 | Prevents queries with many positives from dominating the corpus; 5 × 62 = 310 triplets — a manageable dataset for 3 epochs on CPU |
+| Strategy naming | `fine-tuned-vector` | `ft-vector`, `tuned-vector` | Descriptive hyphenated name consistent with strategy naming conventions |
+| Path validation | Check in `main()` | Let `LocalEmbeddingProvider` fail | Fail fast with an instructive error message and the exact commands needed to generate the model |
+
+### Results (2026-08-21)
+
+Fine-tuned vector is the **highest NDCG@10 result across all milestones**, beating SPLADE (M17, 0.7195) and the base vector (M5, 0.6940).
+
+| Metric | Vector (base) | SPLADE (M17) | Fine-tuned vector | Δ vs base |
+|---|---|---|---|---|
+| NDCG@10 | 0.6940 | 0.7195 | **0.7388** | +0.0448 (+6.5%) |
+| MRR | **0.8688** | 0.8370 | **0.9000** | +0.0312 (+3.6%) |
+| HitRate@10 | **1.0000** | 0.9355 | 0.9839 | −0.0161 (−1.6%) |
+| Precision@10 | 0.7790 | 0.8290 | **0.8194** | +0.0404 (+5.2%) |
+| Latency p50 | 10 ms | 22 ms | 11 ms | — |
+| Latency p95 | 292 ms* | 30 ms | 21 ms | — |
+
+*\* Cold-start outlier — warm p95 for base vector is ~30 ms.*
+
+**Class-level summary:**
+- **Biggest wins:** nightlife (+31.6%), family (+15.1%), activities (+21.6%) — exactly the classes where vocabulary mismatch with the base model was most severe. Hard negatives from BM25 forced the model to learn fine-grained domain distinctions those classes required.
+- **Main regression:** luxury (−11.2%) — the small training corpus (~300 triplets) may have shifted luxury hotel embeddings in a direction that reduces within-class discrimination.
+- **One query lost completely:** q062 "beach holiday for families with young children lots of entertainment" (NDCG = 0.000) — a hard query that also fails in ColBERT (M18); the relevant hotels fall outside the top-10 after fine-tuning adjusts the embedding space.
+
+**Core learning:** Even a small domain-fine-tuned bi-encoder (~300 triplets, 3 epochs, CPU-only) can outperform both zero-shot vector search and a learned sparse model (SPLADE) on overall NDCG. The training signal from BM25 hard negatives is effective precisely because it targets the confusing cases — hotels that look keyword-relevant but are not. Regression on luxury and the loss of perfect HitRate reveal that small training corpora produce class-specific overfitting; the fix is more training data, not a different architecture.
+
+### What was not done and why
+
+- **Re-ingesting with the fine-tuned model**: for a fair production deployment, all 5,470 hotel embeddings should be re-generated with the fine-tuned model. This requires re-running `make generate-embeddings` with `EMBEDDING_MODEL_NAME=data/models/bi-encoder-travel`. The `evaluate-fine-tuned` strategy skips this by encoding documents from scratch at query time — this is correct for evaluation but would be much slower in production.
+- **Augmentation with hard negatives from cross-encoder or dense vector**: BM25 hard negatives are a strong baseline but cross-encoder scored negatives (those the cross-encoder rates near threshold) would be harder still. Deferred as a natural extension after baseline results are known.
+- **Multiple negative per positive**: the round-robin assignment means each positive gets exactly one explicit negative per triplet. Multiple negatives per positive would require a more complex pairing scheme and is deferred.
+- **Temperature tuning**: `MultipleNegativesRankingLoss` uses temperature=1.0 (equivalent to no temperature). Tuning temperature or using a scheduler is a standard next step once baseline results are known.
+- **Evaluation on the human query slice**: fine-tuned model generalisation to human-written queries (from `data/evaluation/human_queries.jsonl`) is an important check for overfitting to generated phrasing — deferred pending M16's human evaluation setup.

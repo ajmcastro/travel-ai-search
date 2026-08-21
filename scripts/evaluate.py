@@ -10,6 +10,7 @@ Usage:
     uv run python scripts/evaluate.py --strategy rewrite   # QU + query rewriting (M10)
     uv run python scripts/evaluate.py --strategy expand    # QU + multi-query expansion (M11)
     uv run python scripts/evaluate.py --strategy bm25
+    uv run python scripts/evaluate.py --strategy fine-tuned-vector  # M19 fine-tuned bi-encoder
     uv run python scripts/evaluate.py --k 10 --no-save     # skip JSON output
     uv run python scripts/evaluate.py --golden data/evaluation/golden_queries.jsonl
 
@@ -324,6 +325,25 @@ def make_splade_fn(
     return search
 
 
+def make_fine_tuned_vector_fn(
+    client: Any, index: str, embedding_provider: Any = None, **_: Any
+) -> Any:
+    """Return a SearchFn that uses vector ANN search with the fine-tuned bi-encoder.
+
+    Delegates entirely to make_vector_fn — the only difference is that the
+    embedding_provider is loaded from the fine-tuned checkpoint path (set via
+    FINE_TUNED_EMBEDDING_MODEL_PATH in .env or the environment).
+
+    The provider is injected by main() after validating that the path exists.
+    This keeps the factory pure and testable independently of the file system.
+
+    Requires:
+        make prepare-fine-tuning-data   (mine hard negatives → pairs JSONL)
+        make fine-tune-embeddings       (train → data/models/bi-encoder-travel/)
+    """
+    return make_vector_fn(client, index, embedding_provider=embedding_provider)
+
+
 def make_colbert_fn(
     client: Any,
     index: str,
@@ -385,6 +405,7 @@ STRATEGIES: dict[str, Any] = {
     "expand": make_expand_fn,
     "splade": make_splade_fn,
     "colbert": make_colbert_fn,
+    "fine-tuned-vector": make_fine_tuned_vector_fn,
 }
 
 
@@ -516,7 +537,20 @@ def main(argv: list[str] | None = None) -> None:
         "expand",
         "colbert",
     )
-    if args.strategy in needs_embeddings:
+    if args.strategy == "fine-tuned-vector":
+        fine_tuned_path = settings.fine_tuned_embedding_model_path
+        if not fine_tuned_path or not Path(fine_tuned_path).exists():
+            print(f"\nERROR: Fine-tuned model not found at '{fine_tuned_path}'")
+            print("  Run the full fine-tuning pipeline first:")
+            print("    make prepare-fine-tuning-data")
+            print("    make fine-tune-embeddings")
+            print("  Then add to .env:")
+            print("    FINE_TUNED_EMBEDDING_MODEL_PATH=data/models/bi-encoder-travel")
+            sys.exit(1)
+        print(f"\nLoading fine-tuned model from '{fine_tuned_path}' …")
+        embedding_provider = LocalEmbeddingProvider(fine_tuned_path)
+        print(f"  dimension={embedding_provider.dimension}")
+    elif args.strategy in needs_embeddings:
         print(f"\nLoading embedding model '{settings.embedding_model_name}' …")
         embedding_provider = LocalEmbeddingProvider(settings.embedding_model_name)
         print(f"  dimension={embedding_provider.dimension}")
