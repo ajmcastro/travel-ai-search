@@ -145,6 +145,26 @@ evaluate-judge: ## LLM-as-judge evaluation (EchoJudge, rrf, generated slice)  [M
 evaluate-judge-all: ## LLM-as-judge: all strategies on both slices + generator-effect gap  [Milestone 16]
 	uv run python scripts/evaluate_judge.py --all-strategies --slice both
 
+# ── SPLADE / learned sparse retrieval (Milestone 17) ──────────────────────────
+# 1. Add the rank_features field to an existing index (skip if you recreate it):
+#      make update-sparse-mapping
+# 2. Encode all hotel descriptions with the SPLADE model:
+#      make generate-sparse-embeddings
+# 3. Evaluate SPLADE against the golden dataset:
+#      make evaluate-splade
+
+.PHONY: update-sparse-mapping
+update-sparse-mapping: ## Add splade_vector rank_features field to existing index  [Milestone 17]
+	uv run python scripts/update_sparse_mapping.py
+
+.PHONY: generate-sparse-embeddings
+generate-sparse-embeddings: ## Encode hotels with SPLADE and update OpenSearch  [Milestone 17]
+	uv run python scripts/generate_sparse_embeddings.py
+
+.PHONY: evaluate-splade
+evaluate-splade: ## Evaluate SPLADE retrieval against the golden dataset  [Milestone 17]
+	uv run python scripts/evaluate.py --strategy splade
+
 # ── Help ───────────────────────────────────────────────────────────────────────
 
 .PHONY: help

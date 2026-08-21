@@ -144,6 +144,19 @@ class Settings(BaseSettings):
     judge_provider: str = "echo"
     bedrock_judge_model_id: str = "amazon.nova-lite-v1:0"
 
+    # Learned sparse retrieval / SPLADE (Milestone 17)
+    # splade_enabled: set True to load LocalSparseProvider at startup.
+    #   When False, GET /search/sparse returns HTTP 503 and the splade strategy
+    #   is unavailable in scripts/evaluate.py.  Defaults to False because the
+    #   SPLADE model is ~300 MB and sparse embeddings must be pre-generated.
+    # splade_model_name: any HuggingFace masked-language model ID.
+    #   Default uses the distilled SPLADE ensemble model from NAVER Labs.
+    # splade_top_k_terms: max vocabulary terms per query vector sent to OpenSearch.
+    #   Higher values improve rare-term recall at the cost of query fan-out.
+    splade_enabled: bool = False
+    splade_model_name: str = "naver/splade-cocondenser-ensemble-distil"
+    splade_top_k_terms: int = 64
+
 
 @lru_cache
 def get_settings() -> Settings:

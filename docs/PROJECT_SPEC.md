@@ -35,6 +35,9 @@ The project must progressively demonstrate:
 19. Graph-enhanced retrieval concepts
 20. Production search architecture and observability
 21. LLM-as-judge evaluation and methodology validity
+22. Learned sparse retrieval and neural vocabulary expansion (SPLADE)
+23. Late interaction retrieval with multi-vector representations (ColBERT)
+24. Two-tower model fine-tuning and domain adaptation
 
 The final application should allow natural-language travel queries such as:
 
@@ -704,6 +707,211 @@ Publish the judge model identity (provider, model ID, version) alongside every s
 
 ---
 
+# Learned sparse retrieval (SPLADE)
+
+## Purpose
+
+BM25 fails when the query and the document use different words for the same concept — "child-friendly" vs "family hotel", "budget" vs "affordable", "peaceful" vs "quiet".  Dense bi-encoders (Milestone 5) solve the vocabulary mismatch problem, but they produce dense vectors where every dimension is active, which requires approximate nearest-neighbour search and makes exact top-K retrieval expensive.
+
+Learned sparse retrieval combines the best properties of both worlds: the vocabulary-level interpretability and inverted-index efficiency of BM25, plus the semantic expansion of neural models.  A transformer model (typically a BERT-based MLM head) takes a query or document and outputs a sparse vector over the full vocabulary (~30,000 terms), where each non-zero value is a learned importance weight.  The model can assign weight to terms that do not appear in the original text, effectively expanding the vocabulary in a data-driven way.
+
+The canonical implementation is **SPLADE** (Sparse Lexical AnD Expansion, Formal et al. 2021).
+
+## Key concept
+
+Given a query `q`, SPLADE computes:
+
+```
+w_t = log(1 + ReLU(h_t)) · IDF(t)   for each vocabulary term t
+```
+
+where `h_t` is the MLM head output for token position `t`, summed across all input positions.  The result is a sparse weight vector over the vocabulary.  The IDF weighting is optional; some variants omit it and rely entirely on learned weights.
+
+For retrieval, the score between query `q` and document `d` is the dot product of their sparse weight vectors — identical in form to BM25, but with learned weights rather than term-frequency statistics.  Because most weights are zero (sparsity regularised via FLOPS loss during training), the inverted index representation remains efficient.
+
+**Comparison with M5 dense retrieval:**
+
+| Property | BM25 | Dense (M5) | SPLADE |
+|---|---|---|---|
+| Vocabulary | Exact terms only | None (latent space) | Vocabulary + expansion |
+| Index type | Inverted | HNSW / ANN | Inverted |
+| Retrieval cost | O(posting list) | O(n · dim) approx | O(sparse posting list) |
+| Semantic expansion | No | Yes (implicit) | Yes (explicit, interpretable) |
+| OOV handling | Fail | Partial | Partial |
+
+## Design requirements
+
+- Implement a `LearnedSparseProvider` Protocol analogous to `EmbeddingProvider`: takes text, returns a `dict[str, float]` of term → weight.
+- Implement `LocalSparseProvider` using a HuggingFace SPLADE checkpoint (e.g., `opensearch-project/opensearch-neural-sparse-encoding-doc-v2-distill` for documents, and its companion query encoder).
+- Create a new OpenSearch index mapping with a `rank_features` field type to store sparse vectors.
+- Implement `sparse_search()` in `retrieval/sparse.py`: builds a `neural_sparse` query (OpenSearch ≥ 2.10) or a `rank_features` query with BM25 dot product scoring.
+- Support two SPLADE modes:
+  - **Bi-encoder mode**: encode both query and document at query time (more accurate, slower at index time).
+  - **Doc-only mode**: encode documents offline at index time; use a lightweight query tokeniser at query time (faster, recommended for production).
+- Add `GET /search/sparse?q=...` endpoint.
+- Add a Makefile target `make sparse-search` and `make generate-sparse-embeddings`.
+- AWS is optional: a `BedrockSparseProvider` may be added if Bedrock exposes a compatible model, but the full system must run locally.
+
+## What to implement
+
+- `retrieval/sparse.py` — `SparseSearchParams`, `SparseSearchResult`, `sparse_search()`
+- `embeddings/sparse.py` — `LearnedSparseProvider` Protocol, `LocalSparseProvider`
+- Scripts: `scripts/generate_sparse_embeddings.py`
+- Updated index mapping with `rank_features` field (`sparse_embedding`)
+- Unit tests: provider output shape (dict, non-negative weights), query construction, score aggregation
+- Integration test: end-to-end sparse search against a populated index
+
+## What to measure
+
+| Metric | Description |
+|---|---|
+| NDCG@10 vs BM25, Vector, RRF | Primary quality comparison |
+| Vocabulary expansion | Inspect top weighted terms for sample queries — are they semantically relevant? |
+| Index size | Compare `rank_features` index size vs `knn_vector` field |
+| Query latency | Compare sparse query p50/p95 vs BM25 and vector |
+| Sparsity | Mean non-zero terms per query/document vector |
+
+Run the existing evaluation CLI (`scripts/evaluate.py --strategy sparse`) and document results in `EXPERIMENTS.md`.
+
+---
+
+# ColBERT — late interaction retrieval
+
+## Purpose
+
+The retrieval methods implemented in Milestones 3–11 represent two extremes of the accuracy-efficiency spectrum:
+
+- **Bi-encoder (M5)**: query and document each compressed to a single vector at index time.  Very fast at query time (ANN lookup), but information is lost in compression.
+- **Cross-encoder (M8)**: query and document processed jointly by the model at query time.  Very accurate (no early compression), but O(candidates) model forward passes — too slow for first-stage retrieval.
+
+**ColBERT** (Khattab & Zaharia, 2020) occupies the middle ground.  It encodes the query and document independently (like a bi-encoder) but retains all token-level embeddings rather than collapsing to a single vector.  Relevance is computed at query time via a **MaxSim** operation: for each query token embedding, find its maximum dot product across all document token embeddings.  The final score is the sum of these per-token maximums.
+
+```
+Score(q, d) = Σ_{i=1}^{|q|}  max_{j=1}^{|d|}  (q_i · d_j)
+```
+
+This is called **late interaction**: the query and document representations interact at the token level, but only after independent encoding — much cheaper than a full cross-encoder forward pass.
+
+## Key concept
+
+**Why MaxSim is more expressive than a single dot product:**
+
+A single-vector bi-encoder compresses the full semantics of a document into one point in embedding space.  A 512-token hotel description must be represented by a 384-dimensional vector — a severe bottleneck.  MaxSim allows each query token to independently seek out the most relevant part of the document.  "Family" can match the paragraph about child facilities; "beach" can match the section about the waterfront — the model does not have to average these signals into a single representation.
+
+**Storage and retrieval cost:**
+
+Each document now stores `M × embedding_dim` floats (where M = sequence length, e.g. 128 tokens × 128 dims = 16,384 floats per document) rather than `embedding_dim` floats.  This is a significant storage increase.  At scale, PLAID (an efficient ColBERT serving system) uses centroid-based compression; for this project a simpler two-stage approach is sufficient:
+
+1. **Candidate generation**: retrieve top-K candidates using the existing bi-encoder ANN index (fast).
+2. **ColBERT re-scoring**: encode the query with the ColBERT model, load the stored token embeddings for each candidate, compute MaxSim scores, re-rank.
+
+This two-stage design reuses the existing retrieval infrastructure and avoids full-corpus MaxSim computation.
+
+## Design requirements
+
+- Implement a `ColBERTReranker` that satisfies the existing `Reranker` Protocol (drop-in replacement for `LocalCrossEncoderReranker`).
+- The reranker must:
+  1. Encode the query into N token embeddings using a ColBERT checkpoint.
+  2. Load pre-stored document token embeddings for each candidate hit.
+  3. Compute MaxSim scores and return re-ranked results.
+- Store per-document token embeddings offline (script: `scripts/generate_colbert_embeddings.py`).  Store as a serialised numpy array alongside the hotel ID, not in OpenSearch (OpenSearch does not natively support multi-vector per document in this form).
+- New field in the OpenSearch document or a separate file-based store: `data/processed/colbert_embeddings/` — one `.npy` file per hotel or a single memory-mapped array.
+- Add `colbert_reranker_enabled` feature flag in settings.
+- Add Makefile target `make generate-colbert-embeddings`.
+- The full system must run without ColBERT if the embeddings are not generated (graceful degradation to cross-encoder or no reranking).
+
+## What to implement
+
+- `reranking/colbert.py` — `ColBERTReranker` implementing the `Reranker` Protocol
+- `scripts/generate_colbert_embeddings.py` — offline token-embedding generation
+- Unit tests: MaxSim computation (known inputs → expected score), token embedding shape, graceful fallback when embeddings missing
+- Integration test: ColBERT re-scores a candidate set correctly (scores differ from bi-encoder order)
+
+## What to measure
+
+Compare ColBERT re-scoring against cross-encoder re-scoring on the same candidate set:
+
+| Metric | Description |
+|---|---|
+| NDCG@10 vs cross-encoder (M8) | Does MaxSim match or exceed the cross-encoder at the same candidate pool size? |
+| Latency vs cross-encoder | MaxSim is cheaper than a full cross-encoder forward pass; quantify the saving |
+| Query-class breakdown | Does ColBERT benefit specific query classes more than others? |
+| Score agreement with cross-encoder | Spearman ρ between ColBERT and cross-encoder ranking of the same candidates |
+| Storage overhead | Token embedding file size vs single-vector embedding size |
+
+Add `--strategy colbert` to `scripts/evaluate.py` and document results in `EXPERIMENTS.md`.
+
+---
+
+# Two-tower model fine-tuning
+
+## Purpose
+
+The bi-encoder used in Milestone 5 (`all-MiniLM-L6-v2`) was trained on general-purpose text pairs (MS MARCO, NLI, STSb, etc.).  It has no exposure to travel vocabulary, hotel descriptions, or the specific relevance relationships in this dataset.  Milestone 19 asks a concrete empirical question: **does fine-tuning the bi-encoder on domain-specific signal improve retrieval quality, and by how much?**
+
+This milestone also introduces the training side of two-tower models — the contrastive learning objectives, the data construction problem, and the hard negative mining strategies that are central to modern dense retrieval training.
+
+## Key concept
+
+**Two-tower architecture (training view):**
+
+Both query and document encoders are trained jointly with a contrastive objective.  During training, a batch contains `B` (query, positive document) pairs.  The positive document for query `i` serves as a hard negative for query `j ≠ i` (in-batch negatives).
+
+The loss function is **MultipleNegativesRankingLoss** (equivalent to InfoNCE / NT-Xent):
+
+```
+L = -log( exp(sim(q, d+) / τ) / Σ_k exp(sim(q, d_k) / τ) )
+```
+
+where `d+` is the positive hotel description, `d_k` ranges over all documents in the batch (positives of other queries become negatives), and `τ` is a temperature parameter.
+
+**Why random negatives are insufficient:**
+
+If the negatives are sampled randomly from the full corpus, they are trivially easy — a query "adults-only luxury spa" will not be confused with a random family budget hotel.  The model quickly learns to push apart very different documents and stops improving.  Hard negatives — documents that look similar to the positive but are not relevant — are needed for the model to learn fine-grained discriminations.
+
+**Hard negative sources:**
+
+1. **BM25 top-K non-relevant**: hotels ranked highly by BM25 for the query but with golden grade 0.
+2. **Dense top-K non-relevant**: hotels ranked highly by the current bi-encoder but irrelevant.
+3. **Cross-encoder ranked non-relevant from dense top-K**: the cross-encoder identifies the truly irrelevant ones among the dense candidates.
+
+For this project, a mix of BM25 and dense hard negatives is sufficient.
+
+## Design requirements
+
+- Add `scripts/fine_tune_embeddings.py` — constructs training triplets from the golden dataset, runs contrastive fine-tuning using `sentence-transformers` training API, and saves the fine-tuned model checkpoint.
+- Training data construction:
+  - For each golden query with at least one relevant hotel (grade ≥ 2): the positive is the hotel description.
+  - Hard negatives: top-K hotels from BM25 with golden grade 0.
+  - Produce `data/evaluation/fine_tuning_pairs.jsonl` — one JSON object per training pair: `{"query": "...", "positive": "...", "negative": "..."}`.
+- Fine-tuned model saved to `data/models/bi-encoder-travel/` (gitignored).
+- Add `fine_tuned_embedding_model_path` setting in `settings.py`; when set, `LocalEmbeddingProvider` loads the fine-tuned model instead of `all-MiniLM-L6-v2`.
+- Add Makefile targets: `make prepare-fine-tuning-data` and `make fine-tune-embeddings`.
+- After fine-tuning: re-generate embeddings with the fine-tuned model (`make generate-embeddings`) and re-run the evaluation (`scripts/evaluate.py --strategy vector --model fine-tuned`).
+- The base model must remain the default; fine-tuning is opt-in via configuration.
+
+## What to implement
+
+- `scripts/fine_tune_embeddings.py` — data preparation + training loop
+- `scripts/prepare_fine_tuning_data.py` — hard negative mining from BM25 and dense rankings
+- Updated `LocalEmbeddingProvider` to accept a model path override
+- Unit tests: training pair construction (correct positive/negative structure), hard negative mining (negatives have golden grade 0)
+- Document the training configuration (epochs, batch size, learning rate, loss function) in `EXPERIMENTS.md`
+
+## What to measure
+
+| Metric | Description |
+|---|---|
+| NDCG@10: fine-tuned vs base model | Primary measure of domain adaptation benefit |
+| Per-query-class breakdown | Which classes benefit most from fine-tuning? |
+| Training data size sensitivity | How does NDCG change as the number of training pairs increases? |
+| Embedding space visualisation (optional) | t-SNE of query and document embeddings before/after fine-tuning — do clusters tighten? |
+| Latency impact | Fine-tuned model may have different inference speed; measure p50/p95 |
+
+Add `--strategy fine-tuned-vector` to `scripts/evaluate.py` and document results in `EXPERIMENTS.md`.  Report whether the improvement justifies the fine-tuning cost and data requirements.
+
+---
+
 # FastAPI
 
 Expose useful APIs.
@@ -953,6 +1161,15 @@ Production API, observability, resilience and final evaluation.
 
 Milestone 16
 LLM-as-judge evaluation: `JudgeProvider` abstraction, `BedrockJudgeProvider` (independent model family from the generator), `LLMEvaluator`, human-annotated held-out query slice, generator-effect measurement, and `POST /evaluate/judge` endpoint.
+
+Milestone 17
+Learned sparse retrieval: `LearnedSparseProvider` Protocol, `LocalSparseProvider` (SPLADE checkpoint), `rank_features` index field, `sparse_search()`, offline sparse embedding generation, `GET /search/sparse` endpoint, evaluation against BM25 and dense vector baselines.
+
+Milestone 18
+ColBERT late interaction: `ColBERTReranker` implementing the `Reranker` Protocol, offline token-embedding generation (`generate_colbert_embeddings.py`), MaxSim re-scoring over bi-encoder candidates, evaluation against the cross-encoder reranker on the same candidate pool.
+
+Milestone 19
+Two-tower fine-tuning: training pair construction from the golden dataset, hard negative mining from BM25 and dense rankings, contrastive training with `MultipleNegativesRankingLoss`, fine-tuned model checkpoint, evaluation of base vs fine-tuned bi-encoder across query classes.
 
 ---
 

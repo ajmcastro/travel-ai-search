@@ -120,6 +120,19 @@ INDEX_BODY: dict[str, Any] = {
                     },
                 },
             },
+            # ── Learned sparse vector (SPLADE) ───────────────────────────────
+            # Stores SPLADE-encoded hotel descriptions as a map of decoded
+            # vocabulary token → learned weight (e.g. {"beach": 0.82, "resort": 0.61}).
+            # rank_features is OpenSearch's native type for this pattern: it
+            # stores the map in a Lucene feature index, enabling efficient
+            # inverted-index retrieval via rank_features queries.
+            #
+            # Populated offline by: make generate-sparse-embeddings
+            # Not present until that step is run; documents without this field
+            # are simply excluded from SPLADE results (no errors).
+            "splade_vector": {
+                "type": "rank_features",
+            },
         }
     },
 }

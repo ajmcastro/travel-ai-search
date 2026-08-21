@@ -93,6 +93,15 @@ def get_destination_graph(request: Request) -> object | None:
     return getattr(request.app.state, "destination_graph", None)
 
 
+def get_splade_provider(request: Request) -> object | None:
+    """Return the shared SPLADE sparse provider stored on app state, or None if not loaded.
+
+    None when splade_enabled=False in settings or when the model failed to load
+    at startup.  The /search/sparse endpoint returns HTTP 503 when this is None.
+    """
+    return getattr(request.app.state, "splade_provider", None)
+
+
 def get_settings() -> Settings:
     """Return the application settings singleton."""
     return _get_settings()

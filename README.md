@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 16 — LLM-as-judge evaluation ✅ Complete
+## Current status: Milestone 17 — Learned sparse retrieval (SPLADE) ✅ Complete
 
 | # | Milestone | Status |
 |---|---|---|
@@ -26,18 +26,19 @@ An educational, production-quality project demonstrating modern AI search archit
 | 13 | RAG / travel knowledge base | ✅ Complete |
 | 14 | Graph-enhanced retrieval prototype | ✅ Complete |
 | 15 | Production API, observability, resilience, final evaluation | ✅ Complete |
-| 16 | LLM-as-judge evaluation | ✅ **Complete** |
+| 16 | LLM-as-judge evaluation | ✅ Complete |
+| 17 | Learned sparse retrieval (SPLADE) | ✅ **Complete** |
 
-### Final evaluation results — BM25 vs Vector vs RRF vs Rerank vs Understand vs Rewrite vs Expand (K=10, 62 queries, 10 query classes)
+### Final evaluation results — BM25 vs Vector vs RRF vs Rerank vs Understand vs Rewrite vs Expand vs SPLADE (K=10, 62 queries, 10 query classes)
 
-| Metric | BM25 | **Vector** | RRF | Rerank | Understand | Rewrite | Expand |
-|---|---|---|---|---|---|---|---|
-| NDCG@10 | 0.5021 | **0.6940** | 0.6239 | 0.6830 | 0.6312 | 0.6130 | 0.6285 |
-| MRR | 0.6874 | **0.8688** | 0.8449 | 0.8191 | 0.8620 | 0.8226 | 0.8308 |
-| HitRate@10 | 0.8387 | **1.0000** | 0.9516 | 0.9516 | 0.9355 | 0.9677 | 0.9516 |
-| Precision@10 | 0.6161 | 0.7790 | 0.7210 | **0.8935** | 0.7290 | 0.7242 | 0.7226 |
-| Latency p50 | 26 ms | **10 ms** | 50 ms | 109 ms | 46 ms | 56 ms | 167 ms |
-| Latency p95 | 46 ms | 292 ms | 86 ms | 178 ms | 75 ms | 126 ms | 218 ms |
+| Metric | BM25 | Vector | RRF | Rerank | Understand | Rewrite | Expand | **SPLADE** |
+|---|---|---|---|---|---|---|---|---|
+| NDCG@10 | 0.5021 | 0.6940 | 0.6239 | 0.6830 | 0.6312 | 0.6130 | 0.6285 | **0.7195** |
+| MRR | 0.6874 | **0.8688** | 0.8449 | 0.8191 | 0.8620 | 0.8226 | 0.8308 | 0.8370 |
+| HitRate@10 | 0.8387 | **1.0000** | 0.9516 | 0.9516 | 0.9355 | 0.9677 | 0.9516 | 0.9355 |
+| Precision@10 | 0.6161 | 0.7790 | 0.7210 | **0.8935** | 0.7290 | 0.7242 | 0.7226 | 0.8290 |
+| Latency p50 | 26 ms | **10 ms** | 50 ms | 109 ms | 46 ms | 56 ms | 167 ms | 22 ms |
+| Latency p95 | 46 ms | 292 ms | 86 ms | 178 ms | 75 ms | 126 ms | 218 ms | **30 ms** |
 
 **Key findings (cumulative):**
 - Vector (M5): NDCG +38.6% vs BM25; `exact_destination` NDCG jumped from 0.18 → 0.84 (+358%); HitRate = 1.000.
@@ -52,6 +53,7 @@ An educational, production-quality project demonstrating modern AI search archit
 - Graph (M14) — in-memory destination graph: 38 nodes (30 destinations + 8 UK airports) and 309 edges built from the knowledge JSONL at startup. Two edge types: `SIMILAR_TO` (curated editorial similarity, bidirectional) and `FLIES_TO` (directed, airport → destination, with realistic long-haul hub restriction). Three exploration endpoints: `GET /graph/similar` (BFS SIMILAR_TO), `GET /graph/destinations` (FLIES_TO from airport), `GET /graph/airports` (reverse FLIES_TO). Demonstrates what graph traversal provides that vector search cannot: exact structural reachability and multi-hop curated similarity chains.
 - Observability (M15) — per-stage pipeline timing (`qu_took_ms`, `rewrite_took_ms`, `lexical_took_ms`, `vector_took_ms`, `reranking_took_ms`, `rag_took_ms`), structured request logging, in-memory Prometheus-compatible metrics (`GET /metrics`), deep health check (`GET /health`), and runtime resilience (rewriter fail → original query; embedding fail → BM25 fallback). 9 new resilience unit tests verify all fallback paths.
 - LLM-as-judge (M16) — `JudgeProvider` Protocol + `EchoJudgeProvider` (no AWS needed) + `BedrockJudgeProvider` (`amazon.nova-lite-v1:0` — different family from the Anthropic Claude generator, to avoid common-mode bias). `LLMEvaluator` scores each retrieved hotel 0–3 with a rationale. Spearman ρ and Kendall τ (from first principles) measure the generator-effect gap between synthetic and human-written query slices. 20 human-written queries in `data/evaluation/human_queries.jsonl`. `POST /evaluate/judge` endpoint + `make evaluate-judge` CLI.
+- SPLADE (M17) — `LearnedSparseProvider` Protocol + `LocalSparseProvider` (HuggingFace SPLADE model). **NDCG@10 = 0.7195 — the highest single-strategy score in the project**, beating pure vector (0.6940) and cross-encoder reranking (0.6830). Encodes queries and documents as sparse vocabulary-weight vectors (SPLADE formula: `w_t = max_i log(1 + ReLU(MLM_logit_{i,t}))`). Stored as `rank_features` in OpenSearch; queried via `bool.should[rank_feature]` — one clause per non-zero vocabulary term. `exact_destination` class is perfect (NDCG=1.000); `luxury` and `nightlife` classes are weakest (NDCG≈0.55–0.60), likely due to vocabulary mismatch between query and document encodings. p95 latency = 30 ms — faster than RRF (86 ms) and reranking (178 ms).
 
 Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
@@ -121,6 +123,15 @@ make generate-knowledge
 # Create knowledge index and ingest 30 destination documents (Milestone 13)
 # Requires: make up + make generate-knowledge first
 make ingest-knowledge
+
+# SPLADE sparse embeddings (Milestone 17) — run after ingest
+# Option A: add rank_features field to existing index (non-destructive)
+make update-sparse-mapping
+# Option B: recreate index from scratch (includes rank_features in mapping)
+# uv run python scripts/create_index.py --recreate && make ingest && make generate-embeddings
+#
+# Then encode all hotel descriptions with the SPLADE model (~300 MB download, ~5-10 min on CPU)
+make generate-sparse-embeddings
 ```
 
 Expected output from `make ingest`:
@@ -182,6 +193,10 @@ make evaluate-judge-all
 
 # With real Bedrock judge (requires AWS credentials and JUDGE_PROVIDER=bedrock in .env)
 uv run python scripts/evaluate_judge.py --all-strategies --slice both --judge-provider bedrock
+
+# SPLADE evaluation (Milestone 17)
+# Requires: make generate-sparse-embeddings first (downloads ~300 MB model on first run)
+make evaluate-splade
 ```
 
 ---
@@ -202,6 +217,7 @@ Available endpoints:
 | `GET /search/lexical?q=...` | BM25 lexical search |
 | `GET /search/vector?q=...` | Dense vector (ANN) search |
 | `GET /search/hybrid?q=...` | Hybrid BM25 + vector (weighted-sum or RRF fusion) |
+| `GET /search/sparse?q=...` | SPLADE learned sparse search (vocabulary expansion via MLM head) |
 | `POST /search` | Full pipeline: QU → optional rewriting → hybrid RRF → optional reranking |
 | `POST /query/understand` | Inspect query understanding extraction result |
 | `POST /evaluate/judge` | LLM-as-judge: score top-K hotels per query (0–3) with rationale |
@@ -287,6 +303,11 @@ curl -X POST "localhost:8000/evaluate/judge" \
 curl -X POST "localhost:8000/search" \
   -H "Content-Type: application/json" \
   -d '{"query": "family beach holiday Greece July from Manchester"}'
+
+# SPLADE sparse search (Milestone 17) — vocabulary expansion via MLM head
+# Requires: SPLADE_ENABLED=true in .env + make generate-sparse-embeddings
+# "quiet adults retreat" may activate "peaceful", "tranquil", "serene" in the index
+curl "localhost:8000/search/sparse?q=quiet+adults+retreat+near+the+sea"
 ```
 
 Response shape:
@@ -357,6 +378,9 @@ make final-eval         # run final evaluation across all strategies + save resu
 make evaluate-judge     # LLM-as-judge dry run (EchoJudge, rrf, generated slice)
 make evaluate-judge-all # LLM-as-judge: all strategies on both slices + generator-effect gap
 make generate-embeddings # generate dense embeddings for all hotels (Milestone 5+)
+make update-sparse-mapping    # add rank_features field to existing index (non-destructive, M17)
+make generate-sparse-embeddings # encode all hotels with SPLADE model (~300 MB, M17)
+make evaluate-splade    # SPLADE evaluation against golden dataset (M17)
 ```
 
 ---
@@ -400,6 +424,9 @@ Copy `.env.example` to `.env` (or run `make env`) and adjust as needed. All sett
 | `KNOWLEDGE_FILE_PATH` | `data/knowledge/destinations.jsonl` | JSONL file used to seed the destination graph |
 | `JUDGE_PROVIDER` | `echo` | LLM judge backend: `echo` (fixed score=2, no AWS) or `bedrock` (M16) |
 | `BEDROCK_JUDGE_MODEL_ID` | `amazon.nova-lite-v1:0` | Judge model — must differ from the generator model family to avoid common-mode bias (M16) |
+| `SPLADE_ENABLED` | `false` | Load SPLADE sparse encoder at startup; when false, `GET /search/sparse` returns 503 (M17) |
+| `SPLADE_MODEL_NAME` | `naver/splade-cocondenser-ensemble-distil` | HuggingFace masked-language model for sparse encoding (~300 MB, cached in `~/.cache/huggingface/`) |
+| `SPLADE_TOP_K_TERMS` | `64` | Max non-zero vocabulary terms per query vector sent to OpenSearch (higher = better recall, slower) |
 
 ---
 
@@ -425,7 +452,8 @@ src/travel_ai_search/
 ├── embeddings/
 │   ├── base.py              # EmbeddingProvider Protocol
 │   ├── local.py             # LocalEmbeddingProvider (sentence-transformers)
-│   └── bedrock.py           # BedrockEmbeddingProvider (Titan V2, M12)
+│   ├── bedrock.py           # BedrockEmbeddingProvider (Titan V2, M12)
+│   └── sparse.py            # LearnedSparseProvider Protocol + LocalSparseProvider (SPLADE, M17)
 ├── evaluation/
 │   ├── dataset.py           # GoldenQuery, GoldenDataset, load_dataset()
 │   ├── evaluator.py         # evaluate(), EvaluationReport, SearchFn type
@@ -455,7 +483,8 @@ src/travel_ai_search/
 │   ├── fusion.py            # FusionMethod enum, fuse_results() (weighted), rrf_fuse() (RRF)
 │   ├── lexical.py           # BM25 multi-match search: lexical_search()
 │   ├── vector.py            # ANN search: vector_search(), _build_vector_query()
-│   └── hybrid.py            # Hybrid orchestration: hybrid_search(), HybridSearchParams
+│   ├── hybrid.py            # Hybrid orchestration: hybrid_search(), HybridSearchParams
+│   └── splade.py            # SPLADE sparse retrieval: splade_search(), _build_splade_query() (M17)
 ├── rag/                     # RAG / destination knowledge (M13)
 │   ├── __init__.py
 │   ├── knowledge.py         # DestinationKnowledge model, build_knowledge_embedding_text()
@@ -481,8 +510,10 @@ scripts/
 ├── generate_knowledge.py    # Generate destination knowledge documents (M13)
 ├── ingest_knowledge.py      # Create knowledge index and ingest 30 docs (M13)
 ├── build_golden_dataset.py  # Build golden evaluation dataset (one-time)
-├── evaluate.py              # Run evaluation: --strategy bm25|vector|hybrid|rrf|rerank|understand|rewrite
+├── evaluate.py              # Run evaluation: --strategy bm25|vector|hybrid|rrf|rerank|understand|rewrite|splade
 ├── evaluate_judge.py        # LLM-as-judge CLI: --strategy, --slice, --judge-provider, generator-effect gap (M16)
+├── update_sparse_mapping.py # Add rank_features field to existing index (non-destructive, M17)
+├── generate_sparse_embeddings.py # Offline SPLADE encoding: all hotels → OpenSearch bulk update (M17)
 ├── export_chat.py           # Export Claude Code chat history to docs/CHAT_HISTORY.md
 └── healthcheck.py           # Verify OpenSearch connectivity
 
@@ -504,7 +535,7 @@ docs/
 └── annotation_guide.md      # Guide for creating and grading human query annotations (M16)
 
 tests/
-├── unit/                    # No infrastructure required (576 tests)
+├── unit/                    # No infrastructure required (620 tests)
 └── integration/             # Requires OpenSearch running (132 tests)
 ```
 
@@ -528,6 +559,7 @@ The `travel_hotels` index maps each hotel field to the OpenSearch type that best
 | `family_friendly`, `adults_only` | `boolean` | Boolean filters |
 | `location` | `geo_point` | Geo-distance queries |
 | `embedding_vector` | `knn_vector` (384-dim, HNSW/lucene) | ANN search (Milestone 5+) |
+| `splade_vector` | `rank_features` | SPLADE sparse encoding: `{vocabulary_term: weight}` (Milestone 17) |
 
 ---
 

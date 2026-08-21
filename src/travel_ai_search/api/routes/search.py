@@ -18,6 +18,7 @@ from travel_ai_search.api.deps import (
     get_rag_synthesizer,
     get_reranker,
     get_settings,
+    get_splade_provider,
 )
 from travel_ai_search.api.schemas.query import QueryUnderstandResponse
 from travel_ai_search.api.schemas.search import (
@@ -26,6 +27,7 @@ from travel_ai_search.api.schemas.search import (
     FullSearchResponse,
     HybridSearchResponse,
     LexicalSearchResponse,
+    SpladeSearchResponse,
     VectorSearchResponse,
 )
 from travel_ai_search.config.settings import Settings
@@ -43,6 +45,7 @@ from travel_ai_search.retrieval.fusion import FusionMethod
 from travel_ai_search.retrieval.hybrid import HybridSearchParams, HybridSearchResult, hybrid_search
 from travel_ai_search.retrieval.lexical import LexicalSearchParams, lexical_search
 from travel_ai_search.retrieval.multi_query import multi_query_search
+from travel_ai_search.retrieval.splade import SpladeSearchParams, splade_search
 from travel_ai_search.retrieval.vector import VectorSearchParams, vector_search
 
 logger = logging.getLogger(__name__)
@@ -129,6 +132,68 @@ def vector_search_endpoint(
     )
     result = vector_search(client, provider, params, index=settings.opensearch_index_name)
     return VectorSearchResponse.from_result(result)
+
+
+@router.get("/sparse", response_model=SpladeSearchResponse)
+def sparse_search_endpoint(
+    q: str = Query("", description="Natural-language search query"),
+    top_k: int = Query(None, ge=1, le=100, description="Maximum results to return"),
+    top_k_terms: int = Query(None, ge=1, le=512, description="Max query vocabulary terms"),
+    country: str | None = Query(None, description="Filter by country name"),
+    destination: str | None = Query(None, description="Filter by exact destination name"),
+    family_friendly: bool | None = Query(None, description="Filter to family-friendly hotels"),
+    adults_only: bool | None = Query(None, description="Filter to adults-only hotels"),
+    min_stars: int | None = Query(None, ge=1, le=5, description="Minimum star rating"),
+    max_price: float | None = Query(None, gt=0, description="Maximum price per person (GBP)"),
+    month: str | None = Query(None, description="Filter to hotels available in this month"),
+    airport: str | None = Query(None, description="Filter by departure airport IATA code"),
+    client: OpenSearch = Depends(get_os_client),
+    loaded_splade: object | None = Depends(get_splade_provider),
+    settings: Settings = Depends(get_settings),
+) -> SpladeSearchResponse:
+    """Learned sparse (SPLADE) search using vocabulary-weight vectors stored in rank_features.
+
+    SPLADE encodes the query using a masked-language model head: each vocabulary term
+    receives a learned weight proportional to its semantic relevance.  Documents are
+    scored by the inner product between query weights and document weights over shared
+    vocabulary terms.
+
+    Unlike BM25, SPLADE supports vocabulary expansion: the model can activate "resort"
+    when the query says "hotel", even with no surface-form overlap.  Unlike dense
+    vector search, results are interpretable — the matched vocabulary terms are visible.
+
+    Requires SPLADE_ENABLED=true in settings and a pre-generated sparse index
+    (run ``make generate-sparse-embeddings`` after ``make ingest``).
+
+    Example:
+        GET /search/sparse?q=quiet+adults+retreat+near+the+sea
+    """
+    from fastapi import HTTPException
+
+    if loaded_splade is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "SPLADE provider is not loaded. "
+                "Set SPLADE_ENABLED=true and run: make generate-sparse-embeddings"
+            ),
+        )
+
+    params = SpladeSearchParams(
+        query=q,
+        top_k=top_k if top_k is not None else settings.top_k,
+        top_k_terms=top_k_terms if top_k_terms is not None else settings.splade_top_k_terms,
+        country=country,
+        destination=destination,
+        family_friendly=family_friendly,
+        adults_only=adults_only,
+        min_star_rating=min_stars,
+        max_price=max_price,
+        month=month,
+        airport=airport,
+    )
+    result = splade_search(client, loaded_splade, params, index=settings.opensearch_index_name)
+    return SpladeSearchResponse.from_result(result)
 
 
 @router.get("/hybrid", response_model=HybridSearchResponse)

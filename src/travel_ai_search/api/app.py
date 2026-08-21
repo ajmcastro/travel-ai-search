@@ -218,6 +218,36 @@ def _create_knowledge_retriever(
         return None
 
 
+def _create_splade_provider(settings: Settings) -> object | None:
+    """Factory — returns None when splade_enabled=False or the model fails to load.
+
+    Graceful degradation: a failed model load logs a warning and all /search/sparse
+    requests return HTTP 503 for this server instance.  The most common failure is
+    the model not yet cached — it downloads ~300 MB from HuggingFace on first run.
+    """
+    if not settings.splade_enabled:
+        return None
+    try:
+        from travel_ai_search.embeddings.sparse import LocalSparseProvider
+
+        logger.info(
+            "Loading SPLADE model '%s' (top_k_terms=%d) …",
+            settings.splade_model_name,
+            settings.splade_top_k_terms,
+        )
+        return LocalSparseProvider(
+            settings.splade_model_name,
+            top_k=settings.splade_top_k_terms,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to load SPLADE model '%s': %s — /search/sparse disabled.",
+            settings.splade_model_name,
+            exc,
+        )
+        return None
+
+
 def _create_destination_graph(settings: Settings) -> object | None:
     """Factory — returns None when graph_enabled=False or the knowledge file is missing.
 
@@ -306,6 +336,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.rag_synthesizer = _create_rag_synthesizer(settings)
     app.state.destination_graph = _create_destination_graph(settings)
+    app.state.splade_provider = _create_splade_provider(settings)
     yield
     app.state.os_client.close()
 

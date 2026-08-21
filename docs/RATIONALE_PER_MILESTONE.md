@@ -1720,3 +1720,105 @@ The 20 human queries were written by a person who read the hotel descriptions bu
 - **`scipy` or `statsmodels` dependency**: standard Spearman and Kendall implementations are available in those libraries, but adding a dependency for ~80 lines of arithmetic is not justified in an educational project.
 - **Judge temperature control**: the Bedrock Converse API allows `inferenceConfig.temperature`; keeping it at the default (slightly above 0) is sufficient for this prompt structure.  Explicit temperature 0 would be preferable for reproducible scoring in a production setting.
 - **Batched LLM calls**: scoring each (query, hotel) pair individually is slow for large slices but straightforward to understand and debug.  A production implementation would batch multiple judgments per API call.
+
+---
+
+## Milestone 17 — Learned sparse retrieval (SPLADE)
+
+### What we added
+
+**New files (6):**
+
+| File | Purpose |
+|---|---|
+| `src/travel_ai_search/embeddings/sparse.py` | `LearnedSparseProvider` Protocol + `LocalSparseProvider` (SPLADE encoding via HuggingFace transformers) |
+| `src/travel_ai_search/retrieval/splade.py` | `SpladeSearchParams`, `SpladeSearchResult`, `_build_splade_query`, `splade_search` |
+| `scripts/generate_sparse_embeddings.py` | Offline encoding: hotel descriptions → SPLADE sparse vectors → OpenSearch bulk update |
+| `scripts/update_sparse_mapping.py` | Non-destructive mapping update: adds `splade_vector` rank_features field without reindexing |
+| `tests/unit/test_splade.py` | 44 unit tests covering token cleaning, query construction, encoding logic, protocol compliance, retrieval function |
+
+**Updated files (9):** `ingestion/index.py` (rank_features field), `config/settings.py` (3 SPLADE settings), `api/schemas/search.py` (`SpladeSearchResponse`), `api/deps.py` (`get_splade_provider`), `api/app.py` (`_create_splade_provider` factory), `api/routes/search.py` (`GET /search/sparse`), `scripts/evaluate.py` (`splade` strategy), `Makefile` (3 new targets), `.env.example` (SPLADE settings).
+
+---
+
+### Concepts
+
+#### SPLADE: learned sparse vectors
+
+SPLADE (SParse Lexical AnD Expansion) combines the inverted-index efficiency of BM25 with learned vocabulary weights from a pre-trained language model.
+
+The weight for vocabulary term `t` given input text is:
+```
+w_t = max_i log(1 + ReLU(MLM_logit_{i,t}))
+```
+
+- `MLM_logit_{i,t}`: the masked-language model's output logit at sequence position `i` for vocabulary term `t`
+- `ReLU(·)`: zero-clamps negative logits → sparsity (most terms have weight 0)
+- `log(1 + ·)`: logarithmic compression → prevents any single term from dominating
+- `max_i`: aggregate over sequence positions → the strongest activation for `t` anywhere in the input survives
+
+The result is a sparse vector over the full BERT vocabulary (~30 K terms) where only semantically relevant terms carry non-zero weight.
+
+#### Vocabulary expansion
+
+The key advantage over BM25: SPLADE can activate vocabulary terms that do not appear in the input text. A hotel description containing "hotel" can get high weight on "resort", "accommodation", "lodging". A query "quiet adults retreat" can activate "relaxation", "peaceful", "spa", "adults-only". This expansion is learned from the pre-training data, not hand-crafted.
+
+BM25 cannot expand vocabulary — it matches only exact stems. Dense vector search expands implicitly via geometric proximity, but the expansion is not interpretable.
+
+#### Bi-encoder vs doc-only SPLADE
+
+The original SPLADE paper proposes two variants:
+- **Bi-encoder**: same model encodes both queries and documents. Simpler; used in this milestone.
+- **Doc-only**: a heavy model encodes documents at index time; a lighter model encodes queries at serving time. Used in production SPLADE deployments for lower query latency.
+
+We use bi-encoder mode (`naver/splade-cocondenser-ensemble-distil` for both sides) as the educational baseline.
+
+#### `rank_features` field type
+
+OpenSearch's `rank_features` field stores a map of `{string: float}` in a Lucene feature index. This is the native type for learned sparse vectors because:
+
+- The inverted index structure gives O(posting list size) retrieval — matching documents are found by following inverted lists for each non-zero query term.
+- The `rank_features` query applies a scoring function (saturation by default) to the stored feature values: `score_t ≈ boost_t × sat(doc_weight_t)`, where `boost_t` is the query-side weight.
+- The field is supported in all OpenSearch 2.x versions (unlike `sparse_vector` which was added in 2.11 and tied to the ML plugin).
+
+The saturation function is an approximation of the exact SPLADE dot product `query_weight_t × doc_weight_t`. The linear function (exact dot product) is available in newer versions.
+
+---
+
+### Design decisions
+
+| Decision | Chosen | Rejected | Reason |
+|---|---|---|---|
+| OpenSearch field type | `rank_features` | `sparse_vector`, `script_score` | Supported across all OpenSearch 2.x; no ML plugin dependency; uses Lucene's native feature index |
+| Token filtering | Only `[a-z][a-z0-9]*` tokens | All non-zero vocabulary terms | Avoids dot-separated field names (nested field paths); subwords (##ing) are not meaningful standalone; keeps vocabulary human-readable |
+| SPLADE model | `naver/splade-cocondenser-ensemble-distil` | NAVER bi-encoder separate query/doc models | Single model is simpler for educational purposes; bi-encoder gives sufficient quality for comparison |
+| Mode | Bi-encoder (same model for query and doc) | Doc-only with lighter query encoder | Simpler pipeline; production difference is latency, not recall |
+| top_k_terms | 64 (configurable) | All non-zero terms | Bounded query fan-out; the top-64 terms by weight capture most of the dot product mass |
+| Default disabled | `SPLADE_ENABLED=false` | Enabled by default | Model is 300 MB and sparse embeddings must be pre-generated; opt-in avoids surprise downloads |
+| Scoring | Saturation function (OpenSearch default) | Exact dot product (linear function) | Saturation is universally supported and a close approximation; linear requires newer versions |
+| Graceful degradation | Empty result when query vector is empty; 503 when provider not loaded | Raise exception | Consistent with the rest of the pipeline's degradation philosophy |
+
+### Evaluation results (2026-08-21, K=10, 62 queries)
+
+| Metric | BM25 | Vector | RRF | Rerank | **SPLADE** |
+|---|---|---|---|---|---|
+| NDCG@10 | 0.5021 | 0.6940 | 0.6239 | 0.6830 | **0.7195** |
+| MRR | 0.6874 | **0.8688** | 0.8449 | 0.8191 | 0.8370 |
+| HitRate@10 | 0.8387 | **1.0000** | 0.9516 | 0.9516 | 0.9355 |
+| Precision@10 | 0.6161 | 0.7790 | 0.7210 | **0.8935** | 0.8290 |
+| Latency p50 | 26 ms | **10 ms** | 50 ms | 109 ms | 22 ms |
+| Latency p95 | 46 ms | 292 ms | 86 ms | 178 ms | **30 ms** |
+
+**Key findings:**
+- SPLADE achieves the best NDCG@10 of any single strategy (0.7195), beating dense vector by +3.7%.
+- `exact_destination` class is perfect (NDCG=1.000). Despite being a semantic model, SPLADE's vocabulary expansion means destination names ("Santorini", "Mallorca") are strongly represented in both query and document vectors — exact match via a learned axis.
+- `luxury` and `nightlife` classes are the weakest (NDCG 0.60 / 0.55). Five queries score exactly 0.000 including "luxury spa resort" and "lively resort entertainment animation". Hypothesis: the SPLADE model's pre-training data does not form strong associations between these travel-domain adjectives ("lively", "high end") and the vocabulary terms that appear in the encoded hotel descriptions.
+- p95 latency (30 ms) is faster than RRF (86 ms) and much faster than reranking (178 ms) — the saturation-function `rank_feature` query runs on Lucene's native inverted index machinery, which is highly optimised.
+- A deployment-time bug surfaced: OpenSearch uses `rank_features` (plural) for the field mapping type but `rank_feature` (singular) for the query clause DSL — an asymmetric naming convention. Dynamic auto-mapping (if embeddings are written before the mapping is declared) silently creates the field as `float` sub-fields, which are rejected at query time with a 400 error. A guard was added to `generate_sparse_embeddings.py` to catch this before encoding starts.
+
+### What was not done and why
+
+- **Three-leg RRF (BM25 + dense + SPLADE):** `rrf_fuse()` already accepts N lists, so adding SPLADE as a third retriever leg is a one-line change. Deferred to allow standalone SPLADE evaluation first — a reasonable next step, especially given the complementary failure modes (BM25 fails on semantic queries; SPLADE fails on luxury/nightlife; dense vector has high p95 variance).
+- **Separate query encoder:** The production SPLADE setup uses `efficient-splade-VI-BT-large-query` for queries and `efficient-splade-VI-BT-large-doc` for documents. Using separate encoders reduces query latency at serving time. Omitted here to keep the educational setup simple.
+- **`neural_sparse` query type:** OpenSearch 2.10+ supports `neural_sparse` queries natively, which do SPLADE encoding inside the ML node. This requires deploying the model to an OpenSearch ML node — a significant operational addition not appropriate for a local Docker dev environment.
+- **Sparse embedding fine-tuning:** SPLADE models fine-tuned on travel-domain data would likely close the gap on luxury/nightlife classes. Fine-tuning is covered conceptually in Milestone 19 (two-tower models).

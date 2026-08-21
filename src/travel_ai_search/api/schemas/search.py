@@ -9,6 +9,7 @@ from travel_ai_search.rag.knowledge import DestinationKnowledge
 from travel_ai_search.retrieval.fusion import FusionMethod
 from travel_ai_search.retrieval.hybrid import HybridSearchResult
 from travel_ai_search.retrieval.lexical import LexicalSearchResult
+from travel_ai_search.retrieval.splade import SpladeSearchResult
 from travel_ai_search.retrieval.vector import VectorSearchResult
 
 
@@ -123,6 +124,33 @@ class HybridSearchResponse(BaseModel):
             lexical_took_ms=result.lexical_took_ms,
             vector_took_ms=result.vector_took_ms,
             reranking_took_ms=result.reranking_took_ms,
+        )
+
+
+class SpladeSearchResponse(BaseModel):
+    """Response for GET /search/sparse — SPLADE learned sparse retrieval.
+
+    n_query_terms is the number of non-zero SPLADE vocabulary terms used in the
+    query vector (capped at splade_top_k_terms).  It is an observability field:
+    compare it across queries to understand how much vocabulary expansion occurred.
+    """
+
+    hits: list[SearchHit]
+    total: int
+    took_ms: int
+    n_query_terms: int
+
+    @classmethod
+    def from_result(cls, result: SpladeSearchResult) -> SpladeSearchResponse:
+        hits = [
+            SearchHit.model_validate({"id": hit.id, "score": hit.score, **hit.source})
+            for hit in result.hits
+        ]
+        return cls(
+            hits=hits,
+            total=result.total,
+            took_ms=result.took_ms,
+            n_query_terms=result.n_query_terms,
         )
 
 

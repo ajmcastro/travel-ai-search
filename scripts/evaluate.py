@@ -293,6 +293,37 @@ def make_expand_fn(
     return search
 
 
+def make_splade_fn(
+    client: Any,
+    index: str,
+    splade_model_name: str = "naver/splade-cocondenser-ensemble-distil",
+    splade_top_k_terms: int = 64,
+    **_: Any,
+) -> Any:
+    """Return a SearchFn that calls SPLADE learned sparse retrieval.
+
+    Downloads the SPLADE model on first run (~300 MB; cached in ~/.cache/huggingface/).
+    Requires that sparse embeddings have been pre-generated:
+        make generate-sparse-embeddings
+    """
+    from travel_ai_search.embeddings.sparse import LocalSparseProvider
+    from travel_ai_search.retrieval.splade import SpladeSearchParams, splade_search
+
+    provider = LocalSparseProvider(splade_model_name, top_k=splade_top_k_terms)
+
+    def search(query_text: str, top_k: int, filters: dict[str, Any]) -> list[str]:
+        params = SpladeSearchParams(
+            query=query_text,
+            top_k=top_k,
+            top_k_terms=splade_top_k_terms,
+            **filters,
+        )
+        result = splade_search(client, provider, params, index=index)
+        return [hit.id for hit in result.hits]
+
+    return search
+
+
 STRATEGIES: dict[str, Any] = {
     "bm25": make_bm25_fn,
     "vector": make_vector_fn,
@@ -302,6 +333,7 @@ STRATEGIES: dict[str, Any] = {
     "understand": make_understand_fn,
     "rewrite": make_rewrite_fn,
     "expand": make_expand_fn,
+    "splade": make_splade_fn,
 }
 
 
@@ -421,7 +453,7 @@ def main(argv: list[str] | None = None) -> None:
     dataset = load_dataset(args.golden)
     print(f"  {len(dataset)} queries across {len(dataset.by_class())} classes")
 
-    # Load embedding model if needed
+    # Load embedding model if needed (SPLADE loads its own model internally)
     embedding_provider = None
     if args.strategy in ("vector", "hybrid", "rrf", "rerank", "understand", "rewrite", "expand"):
         print(f"\nLoading embedding model '{settings.embedding_model_name}' …")
@@ -434,6 +466,8 @@ def main(argv: list[str] | None = None) -> None:
         client,
         settings.opensearch_index_name,
         embedding_provider=embedding_provider,
+        splade_model_name=settings.splade_model_name,
+        splade_top_k_terms=settings.splade_top_k_terms,
     )
 
     # Evaluate

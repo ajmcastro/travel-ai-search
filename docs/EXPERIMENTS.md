@@ -963,3 +963,73 @@ This is a fundamental ceiling of synthetic corpus evaluation: the evaluation set
 - What is the actual Spearman ρ when run with the Bedrock judge?  If ρ < 0.7, the generator effect is large enough to reconsider the synthetic evaluation results for vector search.
 - Does the agreement rate between the judge and the attribute-based labels differ by query class?  Low agreement on `multi_constraint` queries would suggest the judge weighs structured attributes differently from the rule-based labels.
 - Can the 62 generated queries each be given a human rewrite, enabling a statistically reliable paired-Δ measurement of the generator effect?
+
+---
+
+### [Milestone 17] SPLADE learned sparse retrieval vs BM25 and dense vector
+
+**Date:** 2026-08-21
+**Hypothesis:** SPLADE's learned sparse vectors will outperform BM25 on semantic query classes (activities, natural_language, quiet_peaceful) because vocabulary expansion allows matching semantically related terms absent from hotel descriptions. SPLADE should be competitive with dense vector search on these classes while being more interpretable (matched vocabulary terms are observable). On exact-match query classes (exact_destination, multi_constraint) BM25 may retain an edge since SPLADE must share at least one vocabulary term with the index to retrieve a document — exact term matches score high by construction in BM25.
+
+**Configuration:**
+- index: `travel_hotels` (5,470 hotels)
+- SPLADE model: `naver/splade-cocondenser-ensemble-distil` (bi-encoder mode)
+- top_k_terms: 64 (max query vocabulary terms sent to OpenSearch)
+- OpenSearch field: `splade_vector` (rank_features type)
+- scoring: saturation function approximation of the SPLADE inner product
+- dataset: 62 golden queries, K=10
+
+**Pre-requisites (run before evaluating):**
+```bash
+make update-sparse-mapping         # add rank_features field to existing index
+make generate-sparse-embeddings    # encode 5,470 hotels (~5–10 min on CPU)
+make evaluate-splade               # run evaluation
+```
+
+**Results:** *(62 queries, K=10)*
+
+| Strategy | NDCG@10 | MRR | HitRate@10 | Precision@10 | p50 ms | p95 ms |
+|---|---|---|---|---|---|---|
+| BM25 | 0.5021 | 0.6874 | 0.8387 | 0.6161 | 26 ms | 46 ms |
+| Vector | 0.6940 | 0.8688 | 1.0000 | 0.7790 | 10 ms | 292 ms |
+| RRF | 0.6239 | 0.8449 | 0.9516 | 0.7210 | 50 ms | 86 ms |
+| Rerank (RRF + cross-encoder) | 0.6830 | 0.8191 | 0.9516 | **0.8935** | 109 ms | 178 ms |
+| **SPLADE** | **0.7195** | 0.8370 | 0.9355 | 0.8290 | **22 ms** | **30 ms** |
+
+**Per-class breakdown (SPLADE):**
+
+| Query class | n | NDCG@10 | MRR | HitRate@10 | Precision@10 |
+|---|---|---|---|---|---|
+| exact_destination | 10 | **1.0000** | 1.0000 | 1.0000 | 1.0000 |
+| adults_couples | 6 | **0.9124** | 1.0000 | 1.0000 | 1.0000 |
+| family | 9 | 0.7924 | 1.0000 | 1.0000 | 0.8889 |
+| multi_constraint | 6 | 0.7406 | 0.9167 | 1.0000 | 0.9833 |
+| quiet_peaceful | 5 | 0.6297 | 0.8500 | 1.0000 | 0.8200 |
+| natural_language | 4 | 0.6264 | 0.8125 | 1.0000 | 0.8000 |
+| luxury | 6 | 0.5986 | 0.6667 | 0.6667 | 0.6500 |
+| activities | 6 | 0.5895 | 0.6250 | 1.0000 | 0.6667 |
+| nightlife | 5 | 0.5451 | 0.6000 | 0.6000 | 0.5800 |
+| budget | 5 | 0.4107 | 0.6286 | 1.0000 | 0.6800 |
+
+**Zero-score queries (NDCG=0.000):**
+- q028: "luxury spa resort"
+- q031: "high end beach resort luxury"
+- q041: "lively resort entertainment animation"
+- q042: "young party holiday summer beach"
+- q036: "value for money 4 star highly rated" (NDCG=0.031)
+
+**Observability:** The `n_query_terms` field in `GET /search/sparse` responses shows how many vocabulary terms the query was expanded to.  A query like "quiet adults retreat" producing 50–80 non-zero terms demonstrates vocabulary expansion in action.
+
+**Surprises / observations:**
+- **SPLADE achieves the highest overall NDCG@10 (0.7195)** — surpassing dense vector (0.6940), RRF (0.6239), and reranking (0.6830). This is the best single-strategy result in the project.
+- **`exact_destination` class is perfect (1.0000)** despite SPLADE being a semantic model. This is counter-intuitive — destination names like "Santorini" or "Mallorca" apparently activate strongly in the SPLADE vocabulary, matching document encodings precisely.
+- **`luxury` and `nightlife` are the weakest classes** (NDCG 0.60 and 0.55). Several luxury queries score exactly 0.000 — the SPLADE model appears not to expand "luxury spa" or "high end" into the vocabulary terms that appear in the encoded hotel descriptions. This is a vocabulary mismatch: the SPLADE model's pre-training data may not contain strong associations between these query phrases and travel-domain hotel descriptions.
+- **Extremely fast p95 latency (30 ms)** — SPLADE is faster than RRF (86 ms) and far faster than reranking (178 ms) while achieving a higher NDCG. The saturation-function `rank_feature` query is efficiently executed by OpenSearch's term-level inverted index machinery.
+- **A real deployment bug surfaced**: the `rank_features` field type (mapping) and `rank_feature` query clause (DSL) use different names — singular vs plural. Writing documents with the wrong mapping (dynamic auto-mapping as `float`) causes silently wrong behaviour: the documents index successfully but the query is rejected at search time with a 400 error.
+- The `rank_features` scoring uses the saturation function (approximation of dot product), not the exact SPLADE inner product. Results could improve slightly with a linear scoring function available in newer OpenSearch versions.
+
+**Next questions this raises:**
+- Why do luxury/nightlife queries produce zero-score results? Inspecting the actual sparse query vectors for "luxury spa resort" would reveal which vocabulary terms SPLADE activates — if they don't appear in any document vector, retrieval is guaranteed to fail.
+- Would restricting to top_k_terms=32 (vs 64) significantly reduce latency without hurting recall on the high-scoring classes?
+- How does SPLADE compare as a third leg in `rrf_fuse()` alongside BM25 and dense vector? The complementary failure modes (BM25 fails on semantic queries, SPLADE fails on luxury/nightlife) suggest BM25+SPLADE+vector RRF could outperform any single strategy.
+- Does re-encoding with the authenticated `naver/splade-cocondenser-ensemble-distil` model (vs the alternative if a different model was used) change results significantly?
