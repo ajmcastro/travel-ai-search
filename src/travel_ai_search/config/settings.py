@@ -157,6 +157,22 @@ class Settings(BaseSettings):
     splade_model_name: str = "naver/splade-cocondenser-ensemble-distil"
     splade_top_k_terms: int = 64
 
+    # ColBERT late-interaction reranking (Milestone 18)
+    # colbert_model_name: HuggingFace checkpoint for token-level encoding.
+    #   "colbert-ir/colbertv2.0" is the canonical ColBERT v2 model (128-dim projection).
+    #   Alternative for quick tests without a new download:
+    #     "sentence-transformers/all-MiniLM-L6-v2" — already cached, 384-dim (no projection).
+    # colbert_embeddings_dir: directory where generate_colbert_embeddings.py saves .npy files.
+    #   Run `make generate-colbert-embeddings` to populate it.
+    # colbert_doc_maxlen: tokens per document (must match what was used during generation).
+    # colbert_query_maxlen: tokens per query (32 is the ColBERT v2 default).
+    # reranker_provider accepts "local" (cross-encoder), "bedrock", or "colbert".
+    #   Switching to "colbert" also requires colbert_embeddings_dir to be populated.
+    colbert_model_name: str = "colbert-ir/colbertv2.0"
+    colbert_embeddings_dir: str = "data/processed/colbert_embeddings"
+    colbert_doc_maxlen: int = 128
+    colbert_query_maxlen: int = 32
+
 
 @lru_cache
 def get_settings() -> Settings:

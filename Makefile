@@ -165,6 +165,26 @@ generate-sparse-embeddings: ## Encode hotels with SPLADE and update OpenSearch  
 evaluate-splade: ## Evaluate SPLADE retrieval against the golden dataset  [Milestone 17]
 	uv run python scripts/evaluate.py --strategy splade
 
+# ── ColBERT late-interaction reranking (Milestone 18) ─────────────────────────
+# 1. Generate dense embeddings first (for RRF candidate stage):
+#      make generate-embeddings
+# 2. Generate per-document ColBERT token embeddings (one .npy file per hotel):
+#      make generate-colbert-embeddings
+# 3. Evaluate ColBERT reranking against the golden dataset:
+#      make evaluate-colbert
+#
+# Quick start without downloading colbert-ir/colbertv2.0 (~400 MB):
+#   Set COLBERT_MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2 in .env
+#   to reuse the already-cached MiniLM weights (384-dim, same MaxSim mechanism).
+
+.PHONY: generate-colbert-embeddings
+generate-colbert-embeddings: ## Generate ColBERT token embeddings for all hotels  [Milestone 18]
+	uv run python scripts/generate_colbert_embeddings.py
+
+.PHONY: evaluate-colbert
+evaluate-colbert: ## Evaluate ColBERT late-interaction reranking against the golden dataset  [Milestone 18]
+	uv run python scripts/evaluate.py --strategy colbert
+
 # ── Help ───────────────────────────────────────────────────────────────────────
 
 .PHONY: help

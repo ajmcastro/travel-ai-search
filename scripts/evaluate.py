@@ -324,6 +324,56 @@ def make_splade_fn(
     return search
 
 
+def make_colbert_fn(
+    client: Any,
+    index: str,
+    embedding_provider: Any = None,
+    rrf_k: int = 60,
+    candidate_k: int = 50,
+    rerank_k: int = 50,
+    colbert_model_name: str = "colbert-ir/colbertv2.0",
+    colbert_embeddings_dir: str = "data/processed/colbert_embeddings",
+    colbert_query_maxlen: int = 32,
+    colbert_doc_maxlen: int = 128,
+    **_: Any,
+) -> Any:
+    """Return a SearchFn that uses RRF fusion followed by ColBERT late-interaction re-ranking.
+
+    Stage 1: BM25 + vector → RRF fusion → top rerank_k candidates (same as 'rerank').
+    Stage 2: ColBERT MaxSim re-scores each candidate using pre-computed token embeddings.
+
+    Requires:
+        make generate-embeddings          (dense embeddings for stage 1 ANN)
+        make generate-colbert-embeddings  (token embeddings for stage 2 MaxSim)
+
+    The ColBERT model is loaded once and reused across all queries in the run.
+    """
+    from travel_ai_search.reranking.colbert import ColBERTReranker
+
+    provider = embedding_provider
+    reranker = ColBERTReranker(
+        colbert_model_name,
+        embeddings_dir=colbert_embeddings_dir,
+        query_maxlen=colbert_query_maxlen,
+        doc_maxlen=colbert_doc_maxlen,
+    )
+
+    def search(query_text: str, top_k: int, filters: dict[str, Any]) -> list[str]:
+        params = HybridSearchParams(
+            query=query_text,
+            top_k=top_k,
+            candidate_k=candidate_k,
+            fusion=FusionMethod.rrf,
+            rrf_k=rrf_k,
+            rerank_k=max(top_k, rerank_k),
+            **filters,
+        )
+        result = hybrid_search(client, provider, params, index=index, reranker=reranker)
+        return [hit.id for hit in result.hits]
+
+    return search
+
+
 STRATEGIES: dict[str, Any] = {
     "bm25": make_bm25_fn,
     "vector": make_vector_fn,
@@ -334,6 +384,7 @@ STRATEGIES: dict[str, Any] = {
     "rewrite": make_rewrite_fn,
     "expand": make_expand_fn,
     "splade": make_splade_fn,
+    "colbert": make_colbert_fn,
 }
 
 
@@ -455,7 +506,17 @@ def main(argv: list[str] | None = None) -> None:
 
     # Load embedding model if needed (SPLADE loads its own model internally)
     embedding_provider = None
-    if args.strategy in ("vector", "hybrid", "rrf", "rerank", "understand", "rewrite", "expand"):
+    needs_embeddings = (
+        "vector",
+        "hybrid",
+        "rrf",
+        "rerank",
+        "understand",
+        "rewrite",
+        "expand",
+        "colbert",
+    )
+    if args.strategy in needs_embeddings:
         print(f"\nLoading embedding model '{settings.embedding_model_name}' …")
         embedding_provider = LocalEmbeddingProvider(settings.embedding_model_name)
         print(f"  dimension={embedding_provider.dimension}")
@@ -468,6 +529,10 @@ def main(argv: list[str] | None = None) -> None:
         embedding_provider=embedding_provider,
         splade_model_name=settings.splade_model_name,
         splade_top_k_terms=settings.splade_top_k_terms,
+        colbert_model_name=settings.colbert_model_name,
+        colbert_embeddings_dir=settings.colbert_embeddings_dir,
+        colbert_query_maxlen=settings.colbert_query_maxlen,
+        colbert_doc_maxlen=settings.colbert_doc_maxlen,
     )
 
     # Evaluate

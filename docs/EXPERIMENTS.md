@@ -1033,3 +1033,62 @@ make evaluate-splade               # run evaluation
 - Would restricting to top_k_terms=32 (vs 64) significantly reduce latency without hurting recall on the high-scoring classes?
 - How does SPLADE compare as a third leg in `rrf_fuse()` alongside BM25 and dense vector? The complementary failure modes (BM25 fails on semantic queries, SPLADE fails on luxury/nightlife) suggest BM25+SPLADE+vector RRF could outperform any single strategy.
 - Does re-encoding with the authenticated `naver/splade-cocondenser-ensemble-distil` model (vs the alternative if a different model was used) change results significantly?
+
+---
+
+### [Milestone 18] ColBERT late interaction vs cross-encoder and SPLADE
+
+**Date:** 2026-08-21
+**Hypothesis:** ColBERT late-interaction re-ranking of RRF candidates will outperform the cross-encoder (M8) on overall NDCG@10 because the MaxSim operation independently matches each query token against the best document token, avoiding the single-vector bottleneck of the bi-encoder while being cheaper per candidate than the cross-encoder's full joint attention.
+
+**Configuration:**
+- Base retrieval: RRF (BM25 + dense vector), candidate_k=50, rrf_k=60
+- Encoder: `colbert-ir/colbertv2.0` — BERT-base + linear projection 768→128-dim + L2-normalisation
+- Token embeddings stored: `data/processed/colbert_embeddings/<hotel_id>.npy`, shape `(≤128, 128)`, float32 L2-normalised
+- MaxSim formula: `Score(q, d) = Σᵢ max_j (qᵢ · dⱼ)`
+- dataset: 5,470 hotels
+- evaluation set: 62 queries across 10 query classes
+
+**Results:**
+
+| Strategy | NDCG@10 | MRR | HitRate@10 | Precision@10 | p50 ms | p95 ms |
+|---|---|---|---|---|---|---|
+| BM25 (M3) | 0.5021 | 0.6874 | 0.8387 | 0.6161 | 26 | 46 |
+| Vector ANN (M5) | **0.6940** | **0.8688** | **1.0000** | 0.7790 | **10** | 292 |
+| RRF (M7) | 0.6239 | 0.8449 | 0.9516 | 0.7210 | 50 | 86 |
+| Cross-encoder rerank (M8) | 0.6830 | 0.8191 | 0.9516 | **0.8935** | 109 | 178 |
+| SPLADE (M17) | **0.7195** | 0.8370 | 0.9355 | 0.8290 | 22 | **30** |
+| ColBERT (M18) | 0.6294 | 0.7608 | 0.9516 | 0.7484 | 75 | 362 |
+
+**Query-class breakdown (ColBERT):**
+
+| Class | n | NDCG | MRR | HitRate | Precision |
+|---|---|---|---|---|---|
+| adults_couples | 6 | **0.8051** | 0.8889 | 1.000 | 0.9500 |
+| multi_constraint | 6 | 0.7282 | **1.0000** | 1.000 | 0.9333 |
+| exact_destination | 10 | 0.7272 | 0.7843 | 1.000 | 0.8000 |
+| family | 9 | 0.7223 | 0.7659 | 1.000 | 0.8222 |
+| luxury | 6 | 0.6509 | 0.7778 | 1.000 | 0.8000 |
+| nightlife | 5 | 0.6639 | 0.6667 | 0.800 | 0.7600 |
+| quiet_peaceful | 5 | 0.5468 | 0.7667 | 1.000 | 0.7200 |
+| natural_language | 4 | 0.4977 | 0.6250 | 0.750 | 0.6500 |
+| budget | 5 | 0.3792 | 0.7000 | 0.800 | 0.5400 |
+| activities | 6 | **0.3679** | 0.5446 | 1.000 | 0.3667 |
+
+**Zero-score queries (NDCG=0.000):**
+- q036 — "value for money 4 star highly rated"
+- q042 — "young party holiday summer beach"
+- q062 — "beach holiday for families with young children lots of entertainment"
+
+**Surprises / observations:**
+- **Hypothesis was wrong**: ColBERT (0.6294) does *not* outperform the cross-encoder (0.6830). It is only marginally better than plain RRF (0.6239) — the expensive token-level matching adds almost no NDCG gain over rank fusion alone in this dataset.
+- **File I/O dominates latency**: p95 = 362 ms — worse than cross-encoder (178 ms). Opening 50 individual `.npy` files per query costs more than a cross-encoder forward pass on CPU. A single memory-mapped file or `numpy.load(mmap_mode='r')` would dramatically reduce this.
+- **`multi_constraint` is ColBERT's strongest class** (MRR = 1.000 — perfect first-result placement). Queries combining multiple orthogonal constraints ("adults-only all-inclusive spa Canary Islands") benefit from MaxSim's per-token independent matching.
+- **`activities` is ColBERT's worst class** (NDCG = 0.3679), matching the SPLADE pattern. Activity vocabulary ("snorkelling", "paragliding") is represented differently in query tokens vs. document tokens when the model has no domain fine-tuning.
+- **Tokenisation pipeline mismatch (critical)**: `colbert-ir/colbertv2.0` was trained with special `[Q]` and `[D]` prefix tokens injected by the ColBERT library's custom tokenizer. Our `AutoTokenizer` doesn't insert these markers, so the model is running out of distribution. This likely accounts for a meaningful fraction of the gap vs. the cross-encoder.
+- **ColBERT *does* recover the luxury/nightlife gap** vs. SPLADE: luxury NDCG = 0.651 (vs. SPLADE ≈ 0.55), nightlife = 0.664 (vs. SPLADE ≈ 0.60). MaxSim does not rely on vocabulary activation weights, so it is not blocked by the SPLADE vocabulary mismatch.
+
+**Next questions this raises:**
+- Would inserting `[Q]`/`[D]` prefix tokens manually (via the ColBERT library, not raw HuggingFace) recover the gap vs. the cross-encoder?
+- Would `numpy.load(mmap_mode='r')` or loading all embeddings into RAM at startup reduce p95 from 362 ms to a level competitive with the cross-encoder?
+- Would a single pre-loaded numpy matrix (shape `(n_hotels, max_tokens, dim)`) with a hotel-ID → row-index lookup outperform per-file loading at scale?

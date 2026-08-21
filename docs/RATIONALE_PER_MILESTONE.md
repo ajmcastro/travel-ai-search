@@ -1822,3 +1822,119 @@ The saturation function is an approximation of the exact SPLADE dot product `que
 - **Separate query encoder:** The production SPLADE setup uses `efficient-splade-VI-BT-large-query` for queries and `efficient-splade-VI-BT-large-doc` for documents. Using separate encoders reduces query latency at serving time. Omitted here to keep the educational setup simple.
 - **`neural_sparse` query type:** OpenSearch 2.10+ supports `neural_sparse` queries natively, which do SPLADE encoding inside the ML node. This requires deploying the model to an OpenSearch ML node — a significant operational addition not appropriate for a local Docker dev environment.
 - **Sparse embedding fine-tuning:** SPLADE models fine-tuned on travel-domain data would likely close the gap on luxury/nightlife classes. Fine-tuning is covered conceptually in Milestone 19 (two-tower models).
+
+---
+
+## Milestone 18 — ColBERT late-interaction reranking
+
+### What we added
+
+- `src/travel_ai_search/reranking/colbert.py` — `maxsim()` pure function, `ColBERTEncoder` (BERT + optional linear projection), `ColBERTReranker` (implements `Reranker` Protocol via `.npy` file loading)
+- `scripts/generate_colbert_embeddings.py` — offline pipeline that encodes each hotel description into all token embeddings and saves them as `data/processed/colbert_embeddings/<hotel_id>.npy`
+- `tests/unit/test_colbert.py` — 33 unit tests covering MaxSim correctness, reranker routing, graceful degradation, and Protocol compliance
+- `config/settings.py` — 4 new settings: `colbert_model_name`, `colbert_embeddings_dir`, `colbert_doc_maxlen`, `colbert_query_maxlen`; `reranker_provider` now also accepts `"colbert"`
+- `api/app.py` — `_create_reranker()` extended with a `"colbert"` branch
+- `scripts/evaluate.py` — `make_colbert_fn` factory, `"colbert"` registered in `STRATEGIES`, ColBERT kwargs forwarded from `settings`
+- `Makefile` — `generate-colbert-embeddings` and `evaluate-colbert` targets
+
+### Concepts
+
+#### Why MaxSim instead of a single dot product
+
+A bi-encoder collapses a 512-token document to a single 384-dim vector by mean-pooling. That vector must simultaneously represent: destination, amenities, vibe, price range, target guest, and any other attribute a query might care about. MaxSim abandons this constraint entirely:
+
+```
+Score(q, d) = Σᵢ  max_j  (qᵢ · dⱼ)
+```
+
+For each query token embedding `qᵢ`, find the maximum dot product against *all* document token embeddings `dⱼ`, then sum across query tokens. "Family" in the query can match the paragraph about kids clubs; "beach" can match the waterfront description — independently, with no information lost to pooling.
+
+This is why ColBERT captures multi-faceted relevance that the bi-encoder misses. The cross-encoder captures it too (full joint attention), but at a much higher cost.
+
+#### The interaction taxonomy
+
+| Method | Query encoding | Document encoding | Interaction | Cost |
+|---|---|---|---|---|
+| BM25 | term frequencies | inverted index | exact term match | O(postings) |
+| Bi-encoder | single vector | single vector (offline) | one dot product | O(1) |
+| ColBERT | token matrix | token matrix (offline) | MaxSim (q×d dot products) | O(q·d) per candidate |
+| Cross-encoder | — | — | full joint attention (online) | O(L²) per candidate |
+
+"Late interaction" means: document is encoded independently (offline possible) but interacts at the token level at query time. Neither as compressed as a bi-encoder nor as expensive as a cross-encoder.
+
+#### L2 normalisation and the dot-product–cosine equivalence
+
+Both query and document token embeddings are L2-normalised before saving. For unit vectors, dot product equals cosine similarity. This:
+- Makes scores comparable across tokens of different norms (padding tokens often have large norms)
+- Means MaxSim scores are bounded: each term contributes at most 1.0, so the maximum score equals the query sequence length
+- Matches the ColBERT v2 training setup — the model was trained with normalised embeddings
+
+#### The linear projection (768→128 dims)
+
+ColBERT v2 adds a learned linear layer on top of BERT-base (768 hidden dims → 128 output dims). The projection:
+- Reduces storage by 6× vs raw BERT hidden states
+- Speeds up MaxSim (smaller matrices)
+- Improves retrieval quality (the projection is trained jointly with BERT)
+
+`AutoModel.from_pretrained()` loads only the BERT backbone — it silently ignores unknown keys like `linear.weight`. The ColBERT linear layer must be loaded separately from the full state dict. `_load_linear_layer()` handles this with best-effort loading: it tries `.safetensors` then `.bin`, and falls back gracefully to raw hidden states if neither is found.
+
+#### Storage: why per-file .npy rather than OpenSearch
+
+ColBERT v2 produces 128-dimensional embeddings per token. With 128 tokens per document:
+- 128 tokens × 128 dims × 4 bytes (float32) = 65,536 bytes ≈ 64 KB per hotel
+- 5,470 hotels × 64 KB ≈ 350 MB total
+
+OpenSearch `dense_vector` is optimised for ANN index structures (HNSW), not for fetching raw float matrices for client-side computation. Storing 128 separate 128-dim vectors per document in OpenSearch would require 128 separate fields — a poor fit for the schema. Per-file `.npy` arrays:
+- Load in microseconds on SSD (sequential read, no deserialisation overhead)
+- Are human-inspectable with numpy
+- Allow resumable generation (skip already-generated files with `--skip-existing`)
+- Have zero infrastructure dependency (no additional index to manage)
+
+#### Graceful degradation
+
+Hits with missing `.npy` files keep their original retrieval score. This means:
+- A partial generation run still returns results (some ColBERT-scored, some RRF-scored)
+- The API never blocks on a missing file — a warning is logged and retrieval continues
+- You can run `evaluate-colbert` before completing `generate-colbert-embeddings` to see partial results
+
+#### Dependency injection for testing
+
+`ColBERTReranker(…, _encoder=None)` accepts an injected encoder. The leading underscore signals that this parameter is not part of the public API — it exists only for testing. The `_FakeEncoder` in the test suite produces deterministic random arrays from a seed, making tests fast (no model loading), deterministic, and fully verifiable.
+
+### Design decisions
+
+1. **Drop-in via `reranker_provider="colbert"`** — no new API endpoint; the existing `rerank=True` flag routes to ColBERT when `RERANKER_PROVIDER=colbert` and `RERANKING_ENABLED=true`. Same call site, same response schema.
+
+2. **Per-file .npy rather than OpenSearch or SQLite** — see storage rationale above. The main tradeoff is that large-scale deployment (millions of documents) would need a different storage backend (e.g. memory-mapped files, FAISS), but for 5,470 hotels the per-file approach is the clearest and fastest option.
+
+3. **Reuse `_build_reranking_text`** from the cross-encoder reranker — this makes comparisons between cross-encoder and ColBERT apples-to-apples: same document text representation, different scoring mechanism.
+
+4. **Best-effort linear projection loading** — loading ColBERT v2's `linear.weight` requires downloading the full checkpoint state dict separately from what `AutoModel` loads. The fallback to raw hidden states means the same code works with any BERT-family model (e.g. `all-MiniLM-L6-v2`) without modification.
+
+5. **`colbert-ir/colbertv2.0` as default, MiniLM as quick alternative** — for users who already ran `make generate-embeddings` (M5), the MiniLM weights are already cached. Setting `COLBERT_MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2` skips the ~400 MB colbertv2.0 download at the cost of 3× larger embeddings (384 vs 128 dims).
+
+### Results
+
+| Metric | BM25 | Vector | RRF | Rerank | SPLADE | **ColBERT** |
+|---|---|---|---|---|---|---|
+| NDCG@10 | 0.5021 | 0.6940 | 0.6239 | 0.6830 | **0.7195** | 0.6294 |
+| MRR | 0.6874 | **0.8688** | 0.8449 | 0.8191 | 0.8370 | 0.7608 |
+| HitRate@10 | 0.8387 | **1.0000** | 0.9516 | 0.9516 | 0.9355 | 0.9516 |
+| Precision@10 | 0.6161 | 0.7790 | 0.7210 | **0.8935** | 0.8290 | 0.7484 |
+| p50 ms | 26 | **10** | 50 | 109 | 22 | 75 |
+| p95 ms | 46 | 292 | 86 | 178 | **30** | 362 |
+
+**Key findings:**
+- ColBERT (NDCG 0.6294) does *not* outperform the cross-encoder (0.6830) — the hypothesis was wrong. MaxSim adds only marginal gain over plain RRF (0.6239) on this dataset.
+- File I/O is the latency bottleneck: p95 = 362 ms, worse than the cross-encoder (178 ms). Opening 50 `.npy` files per query costs more than a CPU forward pass through the cross-encoder.
+- `multi_constraint` is ColBERT's strongest class (MRR = 1.000 — perfect first-result on every query), suggesting MaxSim handles multi-concept queries well.
+- `activities` is the weakest (NDCG = 0.368). Activity vocabulary mismatch without domain fine-tuning affects ColBERT just as it does SPLADE, but for a different reason: token embedding similarity rather than vocabulary activation weight.
+- ColBERT *recovers* the SPLADE luxury/nightlife gap: luxury NDCG 0.651 vs. SPLADE ≈ 0.55; nightlife 0.664 vs. SPLADE ≈ 0.60. MaxSim is not blocked by vocabulary sparsity.
+- **Critical finding**: the ColBERT library injects special `[Q]` and `[D]` prefix tokens before encoding. Using plain `AutoTokenizer` skips these markers, running the model out of distribution. This likely explains a material part of the quality gap vs. the cross-encoder.
+
+### What was not done and why
+
+- **PLAID / first-stage ColBERT ANN retrieval**: true first-stage ColBERT (as used in production ColBERT systems) replaces the dense ANN retrieval with a learned approximate MaxSim search over the token embedding space. This requires FAISS or a purpose-built index — a significant additional infrastructure dependency not appropriate for this educational project. The two-stage pipeline (ANN candidates → ColBERT MaxSim) is the standard production trade-off and is sufficient to demonstrate the IR concept.
+- **`[Q]`/`[D]` prefix tokens**: The ColBERT library's custom tokenizer prepends `[Q]` to every query and `[D]` to every document before encoding. Our `AutoTokenizer` does not do this, so the model runs out of distribution. Adding proper ColBERT tokenisation would require either the `colbert-ai` package or manual token insertion — a non-trivial change that was deferred to keep the HuggingFace-only dependency footprint clean.
+- **In-memory embedding cache**: Loading 50 `.npy` files per query is the primary latency bottleneck (p95 = 362 ms). A production implementation would pre-load all embeddings into a numpy array at startup (shape `(n_hotels, max_tokens, dim)`) and use a hotel-ID → row-index lookup — eliminating all file I/O at query time. Omitted to keep the generation script and reranker simple and self-explanatory.
+- **float16 storage**: halves disk from 350 MB to 175 MB with typically < 0.1% score difference. Straightforward addition, omitted to keep the generation script simple.

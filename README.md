@@ -6,7 +6,7 @@ An educational, production-quality project demonstrating modern AI search archit
 
 ---
 
-## Current status: Milestone 17 — Learned sparse retrieval (SPLADE) ✅ Complete
+## Current status: Milestone 18 — ColBERT late-interaction reranking ✅ Complete
 
 | # | Milestone | Status |
 |---|---|---|
@@ -27,18 +27,19 @@ An educational, production-quality project demonstrating modern AI search archit
 | 14 | Graph-enhanced retrieval prototype | ✅ Complete |
 | 15 | Production API, observability, resilience, final evaluation | ✅ Complete |
 | 16 | LLM-as-judge evaluation | ✅ Complete |
-| 17 | Learned sparse retrieval (SPLADE) | ✅ **Complete** |
+| 17 | Learned sparse retrieval (SPLADE) | ✅ Complete |
+| 18 | ColBERT late-interaction reranking | ✅ **Complete** |
 
-### Final evaluation results — BM25 vs Vector vs RRF vs Rerank vs Understand vs Rewrite vs Expand vs SPLADE (K=10, 62 queries, 10 query classes)
+### Evaluation results — BM25 vs Vector vs RRF vs Rerank vs SPLADE vs ColBERT (K=10, 62 queries, 10 query classes)
 
-| Metric | BM25 | Vector | RRF | Rerank | Understand | Rewrite | Expand | **SPLADE** |
-|---|---|---|---|---|---|---|---|---|
-| NDCG@10 | 0.5021 | 0.6940 | 0.6239 | 0.6830 | 0.6312 | 0.6130 | 0.6285 | **0.7195** |
-| MRR | 0.6874 | **0.8688** | 0.8449 | 0.8191 | 0.8620 | 0.8226 | 0.8308 | 0.8370 |
-| HitRate@10 | 0.8387 | **1.0000** | 0.9516 | 0.9516 | 0.9355 | 0.9677 | 0.9516 | 0.9355 |
-| Precision@10 | 0.6161 | 0.7790 | 0.7210 | **0.8935** | 0.7290 | 0.7242 | 0.7226 | 0.8290 |
-| Latency p50 | 26 ms | **10 ms** | 50 ms | 109 ms | 46 ms | 56 ms | 167 ms | 22 ms |
-| Latency p95 | 46 ms | 292 ms | 86 ms | 178 ms | 75 ms | 126 ms | 218 ms | **30 ms** |
+| Metric | BM25 | Vector | RRF | Rerank | **SPLADE** | ColBERT |
+|---|---|---|---|---|---|---|
+| NDCG@10 | 0.5021 | 0.6940 | 0.6239 | 0.6830 | **0.7195** | 0.6294 |
+| MRR | 0.6874 | **0.8688** | 0.8449 | 0.8191 | 0.8370 | 0.7608 |
+| HitRate@10 | 0.8387 | **1.0000** | 0.9516 | 0.9516 | 0.9355 | 0.9516 |
+| Precision@10 | 0.6161 | 0.7790 | 0.7210 | **0.8935** | 0.8290 | 0.7484 |
+| Latency p50 | 26 ms | **10 ms** | 50 ms | 109 ms | 22 ms | 75 ms |
+| Latency p95 | 46 ms | 292 ms | 86 ms | 178 ms | **30 ms** | 362 ms |
 
 **Key findings (cumulative):**
 - Vector (M5): NDCG +38.6% vs BM25; `exact_destination` NDCG jumped from 0.18 → 0.84 (+358%); HitRate = 1.000.
@@ -53,7 +54,8 @@ An educational, production-quality project demonstrating modern AI search archit
 - Graph (M14) — in-memory destination graph: 38 nodes (30 destinations + 8 UK airports) and 309 edges built from the knowledge JSONL at startup. Two edge types: `SIMILAR_TO` (curated editorial similarity, bidirectional) and `FLIES_TO` (directed, airport → destination, with realistic long-haul hub restriction). Three exploration endpoints: `GET /graph/similar` (BFS SIMILAR_TO), `GET /graph/destinations` (FLIES_TO from airport), `GET /graph/airports` (reverse FLIES_TO). Demonstrates what graph traversal provides that vector search cannot: exact structural reachability and multi-hop curated similarity chains.
 - Observability (M15) — per-stage pipeline timing (`qu_took_ms`, `rewrite_took_ms`, `lexical_took_ms`, `vector_took_ms`, `reranking_took_ms`, `rag_took_ms`), structured request logging, in-memory Prometheus-compatible metrics (`GET /metrics`), deep health check (`GET /health`), and runtime resilience (rewriter fail → original query; embedding fail → BM25 fallback). 9 new resilience unit tests verify all fallback paths.
 - LLM-as-judge (M16) — `JudgeProvider` Protocol + `EchoJudgeProvider` (no AWS needed) + `BedrockJudgeProvider` (`amazon.nova-lite-v1:0` — different family from the Anthropic Claude generator, to avoid common-mode bias). `LLMEvaluator` scores each retrieved hotel 0–3 with a rationale. Spearman ρ and Kendall τ (from first principles) measure the generator-effect gap between synthetic and human-written query slices. 20 human-written queries in `data/evaluation/human_queries.jsonl`. `POST /evaluate/judge` endpoint + `make evaluate-judge` CLI.
-- SPLADE (M17) — `LearnedSparseProvider` Protocol + `LocalSparseProvider` (HuggingFace SPLADE model). **NDCG@10 = 0.7195 — the highest single-strategy score in the project**, beating pure vector (0.6940) and cross-encoder reranking (0.6830). Encodes queries and documents as sparse vocabulary-weight vectors (SPLADE formula: `w_t = max_i log(1 + ReLU(MLM_logit_{i,t}))`). Stored as `rank_features` in OpenSearch; queried via `bool.should[rank_feature]` — one clause per non-zero vocabulary term. `exact_destination` class is perfect (NDCG=1.000); `luxury` and `nightlife` classes are weakest (NDCG≈0.55–0.60), likely due to vocabulary mismatch between query and document encodings. p95 latency = 30 ms — faster than RRF (86 ms) and reranking (178 ms).
+- SPLADE (M17) — `LearnedSparseProvider` Protocol + `LocalSparseProvider` (HuggingFace SPLADE model). **NDCG@10 = 0.7195 — the highest single-strategy score measured so far**, beating pure vector (0.6940) and cross-encoder reranking (0.6830). Encodes queries and documents as sparse vocabulary-weight vectors (SPLADE formula: `w_t = max_i log(1 + ReLU(MLM_logit_{i,t}))`). Stored as `rank_features` in OpenSearch; queried via `bool.should[rank_feature]` — one clause per non-zero vocabulary term. `exact_destination` class is perfect (NDCG=1.000); `luxury` and `nightlife` classes are weakest (NDCG≈0.55–0.60), likely due to vocabulary mismatch between query and document encodings. p95 latency = 30 ms — faster than RRF (86 ms) and reranking (178 ms).
+- ColBERT (M18) — `ColBERTReranker` implementing the `Reranker` Protocol via MaxSim late interaction: `Score(q,d) = Σᵢ max_j (qᵢ·dⱼ)`. Document token embeddings pre-computed offline by `generate_colbert_embeddings.py` and stored as `data/processed/colbert_embeddings/<hotel_id>.npy` (shape `(≤128, 128)`, L2-normalised float32). At query time: RRF retrieves candidates → query is encoded into token embeddings → MaxSim scores each candidate against its `.npy` file → sorted, top-K returned. Drop-in via `RERANKER_PROVIDER=colbert`. NDCG@10 = 0.6294, slightly above RRF (0.6239) but below cross-encoder (0.6830) and SPLADE (0.7195). Key finding: the hypothesis that MaxSim outperforms cross-encoder did not hold — file I/O loading 50 `.npy` files per query drove p95 to 362 ms (worse than cross-encoder 178 ms), and running `colbert-ir/colbertv2.0` without its custom `[Q]`/`[D]` prefix tokens degraded quality vs. using the full ColBERT library. `multi_constraint` class best (MRR=1.000); `activities` class worst (NDCG=0.368). ColBERT does recover the SPLADE luxury/nightlife gap (NDCG +0.10), as MaxSim is not blocked by vocabulary sparsity.
 
 Full details in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
@@ -132,6 +134,11 @@ make update-sparse-mapping
 #
 # Then encode all hotel descriptions with the SPLADE model (~300 MB download, ~5-10 min on CPU)
 make generate-sparse-embeddings
+
+# ColBERT token embeddings (Milestone 18) — run after generate-embeddings
+# Default model: colbert-ir/colbertv2.0 (~400 MB download on first run)
+# Quick alternative (no new download): set COLBERT_MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2 in .env
+make generate-colbert-embeddings
 ```
 
 Expected output from `make ingest`:
@@ -197,6 +204,10 @@ uv run python scripts/evaluate_judge.py --all-strategies --slice both --judge-pr
 # SPLADE evaluation (Milestone 17)
 # Requires: make generate-sparse-embeddings first (downloads ~300 MB model on first run)
 make evaluate-splade
+
+# ColBERT late-interaction reranking evaluation (Milestone 18)
+# Requires: make generate-embeddings + make generate-colbert-embeddings first
+make evaluate-colbert
 ```
 
 ---
@@ -381,6 +392,8 @@ make generate-embeddings # generate dense embeddings for all hotels (Milestone 5
 make update-sparse-mapping    # add rank_features field to existing index (non-destructive, M17)
 make generate-sparse-embeddings # encode all hotels with SPLADE model (~300 MB, M17)
 make evaluate-splade    # SPLADE evaluation against golden dataset (M17)
+make generate-colbert-embeddings # generate ColBERT token embeddings for all hotels (M18)
+make evaluate-colbert   # ColBERT late-interaction reranking evaluation (M18)
 ```
 
 ---
@@ -411,7 +424,7 @@ Copy `.env.example` to `.env` (or run `make env`) and adjust as needed. All sett
 | `QUERY_EXPANSION_ENABLED` | `false` | Enable multi-query expander at startup |
 | `NUM_EXPANSION_QUERIES` | `3` | Number of query variants to generate per request |
 | `EMBEDDING_PROVIDER` | `local` | Embedding backend: `local` (sentence-transformers) or `bedrock` (Titan V2) |
-| `RERANKER_PROVIDER` | `local` | Reranker backend: `local` (cross-encoder) or `bedrock` (Cohere Rerank v3.5) |
+| `RERANKER_PROVIDER` | `local` | Reranker backend: `local` (cross-encoder), `bedrock` (Cohere Rerank v3.5), or `colbert` (M18) |
 | `AWS_REGION` | `us-east-1` | AWS region for Bedrock API calls |
 | `BEDROCK_EMBEDDING_MODEL_ID` | `amazon.titan-embed-text-v2:0` | Titan Embeddings model ID |
 | `BEDROCK_EMBEDDING_DIMENSION` | `1024` | Titan output dimension (256/512/1024) — must also update `EMBEDDING_DIMENSION` and recreate the index |
@@ -427,6 +440,10 @@ Copy `.env.example` to `.env` (or run `make env`) and adjust as needed. All sett
 | `SPLADE_ENABLED` | `false` | Load SPLADE sparse encoder at startup; when false, `GET /search/sparse` returns 503 (M17) |
 | `SPLADE_MODEL_NAME` | `naver/splade-cocondenser-ensemble-distil` | HuggingFace masked-language model for sparse encoding (~300 MB, cached in `~/.cache/huggingface/`) |
 | `SPLADE_TOP_K_TERMS` | `64` | Max non-zero vocabulary terms per query vector sent to OpenSearch (higher = better recall, slower) |
+| `COLBERT_MODEL_NAME` | `colbert-ir/colbertv2.0` | HuggingFace ColBERT checkpoint (~400 MB); alt: `sentence-transformers/all-MiniLM-L6-v2` (no new download, 384-dim) (M18) |
+| `COLBERT_EMBEDDINGS_DIR` | `data/processed/colbert_embeddings` | Directory of `<hotel_id>.npy` token embedding files produced by `make generate-colbert-embeddings` (M18) |
+| `COLBERT_DOC_MAXLEN` | `128` | Max document tokens; must match what was used during `generate-colbert-embeddings` (M18) |
+| `COLBERT_QUERY_MAXLEN` | `32` | Max query tokens; ColBERT v2 default (M18) |
 
 ---
 
@@ -477,7 +494,8 @@ src/travel_ai_search/
 ├── reranking/
 │   ├── base.py              # Reranker Protocol (runtime_checkable, structural typing)
 │   ├── local.py             # LocalCrossEncoderReranker (sentence-transformers CrossEncoder)
-│   └── bedrock.py           # BedrockReranker (Cohere Rerank v3.5, M12)
+│   ├── bedrock.py           # BedrockReranker (Cohere Rerank v3.5, M12)
+│   └── colbert.py           # ColBERTReranker + ColBERTEncoder + maxsim() (M18)
 ├── retrieval/
 │   ├── types.py             # Shared Hit dataclass (imported by all retrieval modules)
 │   ├── fusion.py            # FusionMethod enum, fuse_results() (weighted), rrf_fuse() (RRF)
@@ -510,16 +528,18 @@ scripts/
 ├── generate_knowledge.py    # Generate destination knowledge documents (M13)
 ├── ingest_knowledge.py      # Create knowledge index and ingest 30 docs (M13)
 ├── build_golden_dataset.py  # Build golden evaluation dataset (one-time)
-├── evaluate.py              # Run evaluation: --strategy bm25|vector|hybrid|rrf|rerank|understand|rewrite|splade
+├── evaluate.py              # Run evaluation: --strategy bm25|vector|hybrid|rrf|rerank|understand|rewrite|splade|colbert
 ├── evaluate_judge.py        # LLM-as-judge CLI: --strategy, --slice, --judge-provider, generator-effect gap (M16)
 ├── update_sparse_mapping.py # Add rank_features field to existing index (non-destructive, M17)
 ├── generate_sparse_embeddings.py # Offline SPLADE encoding: all hotels → OpenSearch bulk update (M17)
+├── generate_colbert_embeddings.py # Offline ColBERT encoding: all hotels → data/processed/colbert_embeddings/ (M18)
 ├── export_chat.py           # Export Claude Code chat history to docs/CHAT_HISTORY.md
 └── healthcheck.py           # Verify OpenSearch connectivity
 
 data/
 ├── processed/
-│   └── hotels.jsonl         # Generated dataset (gitignored)
+│   ├── hotels.jsonl         # Generated dataset (gitignored)
+│   └── colbert_embeddings/  # Per-hotel ColBERT token embeddings: <hotel_id>.npy (M18, gitignored)
 ├── knowledge/
 │   └── destinations.jsonl   # 30 destination knowledge documents (M13)
 └── evaluation/
@@ -535,7 +555,7 @@ docs/
 └── annotation_guide.md      # Guide for creating and grading human query annotations (M16)
 
 tests/
-├── unit/                    # No infrastructure required (620 tests)
+├── unit/                    # No infrastructure required (653 tests)
 └── integration/             # Requires OpenSearch running (132 tests)
 ```
 

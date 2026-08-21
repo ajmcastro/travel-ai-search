@@ -175,6 +175,26 @@ def _create_reranker(settings: Settings) -> Reranker | None:
                 "Failed to create Bedrock reranker: %s — falling back to local.",
                 exc,
             )
+    if settings.reranker_provider == "colbert":
+        try:
+            from travel_ai_search.reranking.colbert import ColBERTReranker
+
+            logger.info(
+                "ColBERT reranker: model=%s dir=%s",
+                settings.colbert_model_name,
+                settings.colbert_embeddings_dir,
+            )
+            return ColBERTReranker(
+                settings.colbert_model_name,
+                embeddings_dir=settings.colbert_embeddings_dir,
+                query_maxlen=settings.colbert_query_maxlen,
+                doc_maxlen=settings.colbert_doc_maxlen,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to create ColBERT reranker: %s — falling back to local.",
+                exc,
+            )
     try:
         from travel_ai_search.reranking.local import LocalCrossEncoderReranker
 
